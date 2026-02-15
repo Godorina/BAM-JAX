@@ -390,20 +390,32 @@ def main():
 
     ckpt_path = Path(config['ckpt'])
     test_path = Path(config['test'])
-    data_path = config['data']
 
-    # Always compute atom energies from data file
-    element = config.get('element', config.get('atomic_numbers'))
-    if element is None:
-        # Auto-detect elements from the data file
-        print("  Auto-detecting elements from data file...")
-        traj_peek = list(iread(data_path, index=":"))
-        all_elements = set()
-        for atoms in traj_peek:
-            all_elements.update(atoms.numbers)
-        element = sorted(list(all_elements))
-        print(f"  Found elements: {element}")
-    config['atom_energies'] = compute_atom_energies(data_path, element)
+    # Load checkpoint early to check for embedded config
+    print(f"Loading checkpoint from {ckpt_path}...")
+    with open(ckpt_path, 'rb') as f:
+        ckpt = pickle.load(f)
+
+    # Use config from checkpoint if available (includes atom_energies)
+    if 'config' in ckpt:
+        print("Using config from checkpoint")
+        model_config = ckpt['config']
+        # Override with eval-specific paths from input json
+        model_config.update({k: v for k, v in config.items() if k in ('ckpt', 'test', 'data')})
+        config = model_config
+    else:
+        # Fall back: compute atom energies from data file
+        data_path = config['data']
+        element = config.get('element', config.get('atomic_numbers'))
+        if element is None:
+            print("  Auto-detecting elements from data file...")
+            traj_peek = list(iread(data_path, index=":"))
+            all_elements = set()
+            for atoms in traj_peek:
+                all_elements.update(atoms.numbers)
+            element = sorted(list(all_elements))
+            print(f"  Found elements: {element}")
+        config['atom_energies'] = compute_atom_energies(data_path, element)
 
     print("=" * 70)
     print("Model Evaluation")
@@ -435,11 +447,6 @@ def main():
         rngs=nnx.Rngs(42)
     )
     graphdef, _ = nnx.split(model, nnx.Param)
-
-    # Load checkpoint
-    print(f"Loading checkpoint from {ckpt_path}...")
-    with open(ckpt_path, 'rb') as f:
-        ckpt = pickle.load(f)
 
     # Use EMA params if available, otherwise regular params
     if 'ema_params' in ckpt:

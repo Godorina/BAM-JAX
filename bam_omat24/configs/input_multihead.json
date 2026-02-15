@@ -1,5 +1,7 @@
 {
     "foundation_ckpt": "/path/to/foundation/ckpt_best.pkl",
+    "atom_energies_path": "/path/to/atom_energies.json",
+    "loss_type": "mae",
 
     "lmax": 3,
     "hidden_irreps": "64x0e + 64x1o + 64x2e",
@@ -40,5 +42,11 @@
             "train_path": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam_omat24-260214/data/substrate_HER_train_cutoff_6.0.pkl",
             "valid_path": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam_omat24-260214/data/substrate_HER_valid_cutoff_6.0.pkl"
         }
-    ]
+    ],
+
+    "predict": {
+        "evaluate_tag": false,
+        "model": "ckpt_best.pkl",
+        "test_path": "/path/to/test.traj"
+    }
 }

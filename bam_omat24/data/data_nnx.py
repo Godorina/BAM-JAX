@@ -1,6 +1,6 @@
 import pickle
 from pathlib import Path
-from typing import Callable, List, Tuple, Iterator, Optional, Literal
+from typing import Callable, Dict, List, Tuple, Iterator, Optional, Literal
 from dataclasses import dataclass
 
 import ase
@@ -63,6 +63,70 @@ def atoms_to_graph(
             "cell": cell,
             "volume": volume,
             "stress": np.zeros((1, 6), dtype=np.float32),
+            "cutoff": np.array([cutoff], dtype=np.float32),
+        },
+    )
+
+
+def atoms_to_graph_with_targets(
+    atoms: ase.Atoms,
+    cutoff: float,
+    atom_energies: np.ndarray,
+    atom_indices: dict,
+) -> Optional[jraph.GraphsTuple]:
+    """Convert an ASE Atoms object to a jraph.GraphsTuple with training targets.
+
+    Same logic as build_pkl_v2.preprocess_graph: computes neighbor list,
+    subtracts isolated atom energies, extracts forces/stress/cell.
+
+    Args:
+        atoms: ASE Atoms object with energy, forces, stress in calculator.
+        cutoff: Cutoff radius for neighbor list computation.
+        atom_energies: Array of per-species reference energies (indexed by species index).
+        atom_indices: Dict mapping atomic number -> species index.
+
+    Returns:
+        jraph.GraphsTuple with targets, or None if no neighbors found.
+    """
+    src, dst, Sij = matscipy.neighbours.neighbour_list("ijS", atoms, cutoff)
+    if len(src) < 20:
+        cutoff = cutoff + 3.0
+        src, dst, Sij = matscipy.neighbours.neighbour_list("ijS", atoms, cutoff)
+        if len(src) == 0:
+            return None
+
+    species = np.array(
+        [atom_indices[n] for n in atoms.get_atomic_numbers()],
+    ).astype(np.int32)
+
+    # Subtract isolated atom energies
+    graph_e0 = 0.0
+    if atom_energies is not None:
+        node_e0 = atom_energies[species]
+        graph_e0 = node_e0.sum()
+
+    energy = np.array([atoms.get_potential_energy() - graph_e0], dtype=np.float32)
+    forces = atoms.get_forces().astype(np.float32)
+    cell = np.array([atoms.get_cell()], dtype=np.float32)
+    volume = np.array([atoms.get_volume()], dtype=np.float32)
+    stress = np.array([atoms.get_stress()], dtype=np.float32)
+
+    return jraph.GraphsTuple(
+        n_node=np.array([len(atoms)], dtype=np.int32),
+        n_edge=np.array([len(src)], dtype=np.int32),
+        nodes={
+            "species": species,
+            "positions": atoms.positions.astype(np.float32),
+            "forces": forces,
+        },
+        edges={"Sij": Sij.astype(np.float32)},
+        senders=dst.astype(np.int32),
+        receivers=src.astype(np.int32),
+        globals={
+            "energy": energy,
+            "cell": cell,
+            "volume": volume,
+            "stress": stress,
             "cutoff": np.array([cutoff], dtype=np.float32),
         },
     )
@@ -188,20 +252,42 @@ class Dataset(nnx.Object):
         file_path: str = None,
         process_id: int = 0,
         n_processes: int = 1,
+        cutoff: float = 6.0,
+        atom_energies: np.ndarray = None,
+        atom_indices: dict = None,
     ):
         """Initialize dataset with optional distributed loading.
 
         Args:
-            file_path: Path to pickle file containing graphs.
+            file_path: Path to pickle file or trajectory file (.traj, .xyz, etc.).
             process_id: Current process/node ID (0 to n_processes-1).
             n_processes: Total number of processes/nodes.
+            cutoff: Cutoff radius (used only for traj/xyz files).
+            atom_energies: Per-species reference energies (used only for traj/xyz files).
+            atom_indices: Atomic number to species index mapping (used only for traj/xyz files).
 
         Example with 1,000,000 graphs and 2 processes:
             Process 0: graphs[0:500,000]
             Process 1: graphs[500,000:1,000,000]
         """
-        with open(file_path, "rb") as f:
-            all_graphs = pickle.load(f)
+        ext = Path(file_path).suffix.lower()
+        if ext == '.pkl':
+            with open(file_path, "rb") as f:
+                all_graphs = pickle.load(f)
+        else:
+            # traj, xyz, extxyz, etc. — read with ASE and convert to graphs
+            import ase.io
+            atoms_list = ase.io.read(file_path, index=':')
+            if atom_indices is None:
+                atom_indices = ATOMIC_NUMBER_TO_INDEX
+            all_graphs = []
+            for atoms in tqdm(atoms_list, desc=f"Converting {Path(file_path).name}"):
+                g = atoms_to_graph_with_targets(
+                    atoms, cutoff=cutoff,
+                    atom_energies=atom_energies, atom_indices=atom_indices,
+                )
+                if g is not None:
+                    all_graphs.append(g)
 
         total_graphs = len(all_graphs)
 

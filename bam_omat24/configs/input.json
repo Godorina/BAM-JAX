@@ -1,5 +1,9 @@
 {
     "cutoff" : 6.0,
+    "train_path": "/path/to/train_pkl_dir_or_traj",
+    "valid_path": "/path/to/valid_pkl_dir_or_traj",
+    "atom_energies_path": "/path/to/atom_energies.json",
+    "loss_type": "mae",
     "hidden_irreps": "640x0e + 320x1o + 128x2e + 128x3o",
     "lmax": 3,
     "n_layers": 5,
@@ -23,7 +27,9 @@
     "grad_clip": 1.0,
     "restart": false,
 
-    "ckpt": "ckpt_best.pkl",
-    "test": "/path/to/test.pkl",
-    "data": "/path/to/train.traj"
+    "predict": {
+        "evaluate_tag": false,
+        "model": "ckpt_best.pkl",
+        "test_path": "/path/to/test.traj"
+    }
 }

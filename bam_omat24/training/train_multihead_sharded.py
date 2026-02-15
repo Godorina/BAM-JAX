@@ -7,7 +7,8 @@ Data from all heads is interleaved during training. Validation is per-head.
 Based on train_sharded.py with multihead extensions.
 """
 
-from typing import Dict, Tuple, List, Any
+from typing import Callable, Dict, Tuple, List, Any
+from functools import partial
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
@@ -27,7 +28,7 @@ from tqdm import tqdm
 from bam_omat24.data.data_nnx import BucketedDataLoader, MultiDeviceDataLoader
 from bam_omat24.data.data_multihead_nnx import DatasetWithHead
 from bam_omat24.models.race_multihead_nnx import RACEMultihead, load_foundation_as_multihead
-from bam_omat24.training.losses import huber_loss
+from bam_omat24.training.losses import LOSS_FUNCTIONS
 from bam_omat24.training.sharding import (
     setup_mesh, replicate, replicate_pytree,
     unreplicate, unreplicate_pytree, squeeze_batch,
@@ -45,7 +46,7 @@ def compute_loss_multihead(
     energy_weight: float,
     force_weight: float,
     stress_weight: float,
-    huber_delta: float,
+    loss_fn: Callable,
     num_heads: int,
 ) -> Tuple[jnp.ndarray, Dict]:
     """Compute loss for a multihead batch.
@@ -64,20 +65,20 @@ def compute_loss_multihead(
 
     # Energy loss (per-graph, normalized by n_node)
     energy_diff = (energy - batch.globals["energy"]) / batch.n_node
-    energy_loss = huber_loss(energy_diff, delta=huber_delta)
+    energy_loss = loss_fn(energy_diff)
     energy_loss = jnp.sum(energy_loss * graph_mask) / n_graphs
     energy_mse = jnp.sum(energy_diff ** 2 * graph_mask) / n_graphs
 
     # Force loss
     forces_diff = forces - batch.nodes["forces"]
-    force_loss = huber_loss(forces_diff, delta=huber_delta)
+    force_loss = loss_fn(forces_diff)
     force_loss = jnp.sum(force_loss * node_mask[:, None]) / (3 * n_atoms)
     force_mse = jnp.sum(forces_diff ** 2 * node_mask[:, None]) / (3 * n_atoms)
 
     # Stress loss
     stress_diff = (stress - batch.globals["stress"]) * graph_mask[:, None]
     stress_loss = jnp.sum(
-        huber_loss(stress_diff, delta=huber_delta) * graph_mask[:, None]
+        loss_fn(stress_diff) * graph_mask[:, None]
     ) / n_graphs
     stress_mse = jnp.sum(stress_diff ** 2 * graph_mask[:, None]) / n_graphs
 
@@ -147,7 +148,7 @@ def make_sharded_train_step(
     energy_weight: float = 1.0,
     force_weight: float = 1.0,
     stress_weight: float = 1.0,
-    huber_delta: float = 0.1,
+    loss_fn: Callable = None,
     ema_decay: float = 0.99,
     num_heads: int = 2,
 ):
@@ -158,14 +159,14 @@ def make_sharded_train_step(
     ):
         batch = squeeze_batch(batch)
 
-        def loss_fn(params):
+        def loss_fn_inner(params):
             return compute_loss_multihead(
                 graphdef, params, batch,
                 energy_weight, force_weight, stress_weight,
-                huber_delta, num_heads,
+                loss_fn, num_heads,
             )
 
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (loss, aux), grads = jax.value_and_grad(loss_fn_inner, has_aux=True)(params)
 
         # Synchronize across devices
         grads = jax.lax.pmean(grads, axis_name='dp')
@@ -219,7 +220,7 @@ def make_sharded_train_step(
 # Sharded Evaluation (per-head)
 # =============================================================================
 
-def make_sharded_evaluate_step(mesh: Mesh, huber_delta: float, num_heads: int):
+def make_sharded_evaluate_step(mesh: Mesh, loss_fn: Callable, num_heads: int):
     """Create sharded evaluation function for multihead model."""
 
     def eval_single_device(graphdef, params, batch):
@@ -231,11 +232,11 @@ def make_sharded_evaluate_step(mesh: Mesh, huber_delta: float, num_heads: int):
         energy, forces, stress = model(batch)
 
         energy_diff = (energy - batch.globals["energy"]) / batch.n_node
-        energy_loss = huber_loss(energy_diff, delta=huber_delta)
+        energy_loss = loss_fn(energy_diff)
         forces_diff = forces - batch.nodes["forces"]
-        force_loss = huber_loss(forces_diff, delta=huber_delta)
+        force_loss = loss_fn(forces_diff)
         stress_diff = (stress - batch.globals["stress"]) * graph_mask[:, None]
-        stress_loss = huber_loss(stress_diff, delta=huber_delta)
+        stress_loss = loss_fn(stress_diff)
 
         return {
             'energy_loss': jnp.sum(energy_loss * graph_mask),
@@ -274,7 +275,7 @@ def evaluate_per_head(
     energy_weight: float,
     force_weight: float,
     stress_weight: float,
-    huber_delta: float,
+    loss_fn: Callable,
     num_heads: int,
 ) -> Tuple[Dict, float]:
     """Evaluate model on each head's validation set separately.
@@ -283,7 +284,7 @@ def evaluate_per_head(
         Tuple of (per_head_metrics_dict, total_val_loss).
     """
     params_replicated = replicate_pytree(params, mesh)
-    eval_step = make_sharded_evaluate_step(mesh, huber_delta, num_heads)
+    eval_step = make_sharded_evaluate_step(mesh, loss_fn, num_heads)
 
     all_head_metrics = {}
     total_val_loss = 0.0
@@ -498,7 +499,9 @@ def train_multihead_sharded(config: Dict):
     energy_weight = config.get('energy_weight', 1.0)
     force_weight = config.get('force_weight', 1.0)
     stress_weight = config.get('stress_weight', 1.0)
+    loss_type = config.get('loss_type', 'huber')
     huber_delta = config.get('huber_delta', 0.02)
+    loss_fn = partial(LOSS_FUNCTIONS[loss_type], delta=huber_delta)
 
     train_step = make_sharded_train_step(
         optimizer=optimizer,
@@ -506,7 +509,7 @@ def train_multihead_sharded(config: Dict):
         energy_weight=energy_weight,
         force_weight=force_weight,
         stress_weight=stress_weight,
-        huber_delta=huber_delta,
+        loss_fn=loss_fn,
         ema_decay=config.get('ema_decay', 0.99),
         num_heads=num_heads,
     )
@@ -655,7 +658,7 @@ def train_multihead_sharded(config: Dict):
             energy_weight=energy_weight,
             force_weight=force_weight,
             stress_weight=stress_weight,
-            huber_delta=huber_delta,
+            loss_fn=loss_fn,
             num_heads=num_heads,
         )
         val_time = time.time() - val_start
@@ -731,7 +734,9 @@ def train_multihead_sharded(config: Dict):
 # =============================================================================
 
 if __name__ == "__main__":
+    import sys
     import json
+    from pathlib import Path
     from bam_omat24.data.atom_energies import ATOM_ENERGIES
 
     print("=" * 70)
@@ -743,8 +748,19 @@ if __name__ == "__main__":
     print("=" * 70)
 
     # Load config
-    with open('input/input_multihead_omat24.json') as f:
+    config_path = sys.argv[1] if len(sys.argv) > 1 else 'input.json'
+    print(f"Loading config from {config_path}")
+    with open(config_path) as f:
         config = json.load(f)
-    config['atom_energies'] = ATOM_ENERGIES
+
+    # Load atom energies: from JSON file or fallback to built-in ATOM_ENERGIES
+    atom_energies_path = config.get('atom_energies_path', None)
+    if atom_energies_path and Path(atom_energies_path).exists():
+        print(f"Loading atom energies from {atom_energies_path}")
+        with open(atom_energies_path) as f:
+            config['atom_energies'] = json.load(f)
+    else:
+        print("Using built-in ATOM_ENERGIES")
+        config['atom_energies'] = ATOM_ENERGIES.tolist()
 
     train_multihead_sharded(config)

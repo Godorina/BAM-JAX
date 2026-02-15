@@ -17,7 +17,8 @@ Both training AND evaluation are sharded across all GPUs.
 # Force deterministic cuDNN algorithms
 #os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 
-from typing import Dict, Tuple, List, Any
+from typing import Callable, Dict, Tuple, List, Any
+from functools import partial
 import json
 import pickle
 import jax
@@ -38,7 +39,7 @@ from tqdm import tqdm
 
 from bam_omat24.data.data_nnx import Dataset, BucketedDataLoader, MultiDeviceDataLoader
 from bam_omat24.models.race_nnx import RACE
-from bam_omat24.training.losses import huber_loss
+from bam_omat24.training.losses import LOSS_FUNCTIONS
 from bam_omat24.training.sharding import (
     setup_mesh, replicate, replicate_pytree,
     unreplicate, unreplicate_pytree, squeeze_batch,
@@ -58,7 +59,7 @@ def compute_loss(
     energy_weight: float,
     force_weight: float,
     stress_weight: float,
-    huber_delta: float
+    loss_fn: Callable
 ) -> Tuple[jnp.ndarray, Dict]:
     """Compute loss for a single batch (no device dimension)."""
     graph_mask = jraph.get_graph_padding_mask(batch)
@@ -72,19 +73,19 @@ def compute_loss(
 
     # Energy loss
     energy_diff = (energy - batch.globals["energy"])/batch.n_node
-    energy_loss = huber_loss(energy_diff, delta=huber_delta)
+    energy_loss = loss_fn(energy_diff)
     energy_loss = jnp.sum(energy_loss * graph_mask) / n_graphs
     energy_mse = jnp.sum(energy_diff ** 2 * graph_mask) / n_graphs
 
     # Force loss
     forces_diff = forces - batch.nodes["forces"]
-    force_loss = huber_loss(forces_diff, delta=huber_delta)
+    force_loss = loss_fn(forces_diff)
     force_loss = jnp.sum(force_loss * node_mask[:, None]) / (3 * n_atoms)
     force_mse = jnp.sum(forces_diff ** 2 * node_mask[:, None]) / (3 * n_atoms)
 
     # Stress loss
     stress_diff = (stress - batch.globals["stress"]) * graph_mask[:, None]
-    stress_loss = jnp.sum(huber_loss(stress_diff, delta=huber_delta) * graph_mask[:, None]) / n_graphs
+    stress_loss = jnp.sum(loss_fn(stress_diff) * graph_mask[:, None]) / n_graphs
     stress_mse = jnp.sum(stress_diff ** 2 * graph_mask[:, None]) / n_graphs
 
     total_loss = energy_weight * energy_loss + force_weight * force_loss + stress_weight * stress_loss
@@ -113,7 +114,7 @@ def make_sharded_train_step(
     energy_weight: float = 1.0,
     force_weight: float = 1.0,
     stress_weight: float = 1.0,
-    huber_delta: float = 0.1,
+    loss_fn: Callable = None,
     ema_decay: float = 0.99
 ):
     """Create sharded training step with gradient synchronization.
@@ -131,7 +132,7 @@ def make_sharded_train_step(
         def loss_fn(params):
             return compute_loss(
                 graphdef, params, batch,
-                energy_weight, force_weight, stress_weight, huber_delta
+                energy_weight, force_weight, stress_weight, loss_fn
             )
 
         # Compute gradients locally
@@ -206,7 +207,7 @@ def make_sharded_train_step(
 # Sharded Evaluation
 # =============================================================================
 
-def make_sharded_evaluate_step(mesh: Mesh, huber_delta: float):
+def make_sharded_evaluate_step(mesh: Mesh, loss_fn: Callable):
     """Create sharded evaluation function that runs on all GPUs.
 
     Each device evaluates its own batch, then results are summed across devices.
@@ -228,11 +229,11 @@ def make_sharded_evaluate_step(mesh: Mesh, huber_delta: float):
         energy, forces, stress = model(batch)
 
         energy_diff = (energy - batch.globals["energy"])/batch.n_node
-        energy_loss = huber_loss(energy_diff, delta=huber_delta)
+        energy_loss = loss_fn(energy_diff)
         forces_diff = forces - batch.nodes["forces"]
-        force_loss = huber_loss(forces_diff, delta=huber_delta)
+        force_loss = loss_fn(forces_diff)
         stress_diff = (stress - batch.globals["stress"]) * graph_mask[:, None]
-        stress_loss = huber_loss(stress_diff, delta=huber_delta)
+        stress_loss = loss_fn(stress_diff)
         # Return sums weighted by actual counts for proper aggregation
         return {
             'energy_loss': jnp.sum(energy_loss * graph_mask),
@@ -279,7 +280,7 @@ def evaluate_sharded(
     energy_weight: float = 1.0,
     force_weight: float = 1.0,
     stress_weight: float = 1.0,
-    huber_delta: float = 0.02
+    loss_fn: Callable = None
 ) -> Dict:
     """Evaluate model on validation set using all GPUs.
 
@@ -293,7 +294,7 @@ def evaluate_sharded(
         energy_weight: Weight for energy in loss
         force_weight: Weight for forces in loss
         stress_weight: Weight for stress in loss
-        huber_delta: Huber loss delta
+        loss_fn: Loss function (e.g., partial(huber_loss, delta=0.02))
 
     Returns:
         Dictionary with evaluation metrics
@@ -317,7 +318,7 @@ def evaluate_sharded(
     }
 
     # Create sharded evaluation function
-    eval_step = make_sharded_evaluate_step(mesh, huber_delta=huber_delta)
+    eval_step = make_sharded_evaluate_step(mesh, loss_fn=loss_fn)
 
     for fname in tqdm(files_pkl, desc="Evaluating files", leave=False):
         dataset = Dataset(file_path=fname)
@@ -443,6 +444,10 @@ def predict_sharded(config: Dict):
     print("Running Evaluation")
     print("=" * 70)
 
+    loss_type = model_config.get('loss_type', 'huber')
+    huber_delta = model_config.get('huber_delta', 0.02)
+    loss_fn = partial(LOSS_FUNCTIONS[loss_type], delta=huber_delta)
+
     metrics = evaluate_sharded(
         graphdef=graphdef,
         params=params,
@@ -453,7 +458,7 @@ def predict_sharded(config: Dict):
         energy_weight=model_config.get('energy_weight', 1.0),
         force_weight=model_config.get('force_weight', 1.0),
         stress_weight=model_config.get('stress_weight', 1.0),
-        huber_delta=model_config.get('huber_delta', 0.02)
+        loss_fn=loss_fn
     )
 
     # Print results
@@ -563,7 +568,9 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
     energy_weight=config.get('energy_weight', 1.0)
     force_weight=config.get('force_weight', 1.0)
     stress_weight=config.get('stress_weight', 1.0)
-    huber_delta=config.get('huber_delta', 0.02)
+    loss_type = config.get('loss_type', 'huber')
+    huber_delta = config.get('huber_delta', 0.02)
+    loss_fn = partial(LOSS_FUNCTIONS[loss_type], delta=huber_delta)
     # Training step
     train_step = make_sharded_train_step(
         optimizer=optimizer,
@@ -571,7 +578,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
         energy_weight=energy_weight,
         force_weight=force_weight,
         stress_weight=stress_weight,
-        huber_delta=huber_delta,
+        loss_fn=loss_fn,
         ema_decay=config.get('ema_decay', 0.99)
     )
 
@@ -684,7 +691,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
                 energy_weight=energy_weight,
                 force_weight=force_weight,
                 stress_weight=stress_weight,
-                huber_delta=huber_delta
+                loss_fn=loss_fn
             )
             val_time = time.time() - val_start
 
@@ -748,6 +755,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
 # =============================================================================
 
 if __name__ == "__main__":
+    import sys
     import json
     from bam_omat24.data.atom_energies import ATOM_ENERGIES
 
@@ -757,6 +765,24 @@ if __name__ == "__main__":
             return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', str(s))]
         return sorted(lst, key=natural_key)
 
+    def resolve_data_files(data_path_str):
+        """Resolve a data path to a list of files.
+
+        - Directory → glob for *.pkl files
+        - Single .pkl file → [file]
+        - Single .traj/.xyz/etc → [file]
+        """
+        p = Path(data_path_str)
+        if p.is_dir():
+            files = natsorted(list(p.glob('*.pkl')))
+            if not files:
+                raise FileNotFoundError(f"No .pkl files found in {p}")
+            return [str(f) for f in files]
+        elif p.exists():
+            return [str(p)]
+        else:
+            raise FileNotFoundError(f"Data path not found: {p}")
+
 
     print("=" * 70)
     print(f"JAX version: {jax.__version__}")
@@ -765,9 +791,20 @@ if __name__ == "__main__":
     print("=" * 70)
 
     # Load config
-    with open('/home/gpuuser/prog/BAM-nequip-main/bam_omat24/input_omat24.json') as f:
+    config_path = sys.argv[1] if len(sys.argv) > 1 else 'input.json'
+    print(f"Loading config from {config_path}")
+    with open(config_path) as f:
         config = json.load(f)
-    config['atom_energies'] = ATOM_ENERGIES
+
+    # Load atom energies: from JSON file or fallback to built-in ATOM_ENERGIES
+    atom_energies_path = config.get('atom_energies_path', None)
+    if atom_energies_path and Path(atom_energies_path).exists():
+        print(f"Loading atom energies from {atom_energies_path}")
+        with open(atom_energies_path) as f:
+            config['atom_energies'] = json.load(f)
+    else:
+        print("Using built-in ATOM_ENERGIES")
+        config['atom_energies'] = ATOM_ENERGIES.tolist()
 
     # Branch: predict (eval) or train
     predict_config = config.get('predict', {})
@@ -779,22 +816,25 @@ if __name__ == "__main__":
         print("Mode: Training")
         print("=" * 70)
 
-        train_path = Path('/dataset/usr004/hgpark/jax_omat_data/train_pkl')
-        valid_path = Path('/dataset/usr004/hgpark/jax_omat_data/val_pkl')
+        train_path = config.get('train_path', '')
+        valid_path = config.get('valid_path', '')
 
-        print("Scanning for pickle files...")
-        train_files = natsorted(list(train_path.glob('omat*.pkl')))
-        valid_files = natsorted(list(valid_path.glob('omat*.pkl')))
+        if not train_path or not valid_path:
+            print("ERROR: 'train_path' and 'valid_path' must be set in config")
+            sys.exit(1)
+
+        train_files = resolve_data_files(train_path)
+        valid_files = resolve_data_files(valid_path)
 
         print(f"Training files: {len(train_files)}")
         for i, f in enumerate(train_files[:5]):
-            print(f"  [{i}] {f.name}")
+            print(f"  [{i}] {Path(f).name}")
         if len(train_files) > 5:
             print(f"  ... and {len(train_files) - 5} more files")
 
         print(f"Validation files: {len(valid_files)}")
         for i, f in enumerate(valid_files[:3]):
-            print(f"  [{i}] {f.name}")
+            print(f"  [{i}] {Path(f).name}")
         if len(valid_files) > 3:
             print(f"  ... and {len(valid_files) - 3} more files")
 

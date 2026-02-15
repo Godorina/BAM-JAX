@@ -749,11 +749,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
 
 if __name__ == "__main__":
     import json
-    #from natsort import natsorted
     from bam_omat24.data.atom_energies import ATOM_ENERGIES
-
-    import json
-    # from natsort import natsorted
 
     import re
     def natsorted(lst):

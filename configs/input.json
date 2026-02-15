@@ -1,6 +1,6 @@
 {
     "cutoff" : 6.0,
-    "hidden_irreps": "320x0e + 128x1o + 128x2e + 128x3o",
+    "hidden_irreps": "640x0e + 320x1o + 128x2e + 128x3o",
     "lmax": 3,
     "n_layers": 5,
     "radial_basis_size": 8,
@@ -17,7 +17,7 @@
     "energy_weight": 100.0,
     "force_weight": 1.0,
     "stress_weight": 1.0,
-    "huber_weight": 0.02,
+    "huber_delta": 0.02,
     "log_every": 100,
     "ema_decay": 0.99,
     "grad_clip": 1.0,

@@ -387,7 +387,7 @@ class RACE(nnx.Module):
             cutoff_per_edge = jnp.full((num_edges,), self.cutoff)
 
         cutoff_per_edge = jnp.where(cutoff_per_edge > 1.0, cutoff_per_edge, 1.0)
-        cutoff_per_edge = cutoff_per_edge.squeeze() # [n_edges,]
+        cutoff_per_edge = cutoff_per_edge.reshape(-1) # [n_edges,]
 
         # safe norm (avoids nan for r = 0)
         square_r_norm = jnp.sum(r**2, axis=-1)
@@ -432,8 +432,8 @@ class RACE(nnx.Module):
                 data.nodes["species"],
                 x_feats)
             outputs += [node_energies.array[:,0]
-                        + x_energy.array.squeeze()
-                        + f_energy.array.squeeze()]
+                        + x_energy.array[:, 0]
+                        + f_energy.array[:, 0]]
 
         node_energies = jnp.sum(
             jnp.stack(outputs, axis=1),

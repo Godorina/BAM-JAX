@@ -326,27 +326,6 @@ class Linear(nnx.Module):
         sanitized = sanitized.strip("_")
         return f"weight_{sanitized}"
 
-        # name = "w[0,0] 64x0e,1x0e"
-
-        # sanitized = name.replace("[", "_").replace("]", "_")
-        ## "w_0,0_ 64x0e,1x0e"
-
-        # sanitized = sanitized.replace(",", "_").replace(" ", "_")
-        ## "w_0_0__64x0e_1x0e"
-
-        # sanitized = sanitized.replace(".", "_")
-        ## "w_0_0__64x0e_1x0e"  (점 없으니 변화 없음)
-
-        # while "__" in sanitized:
-            # sanitized = sanitized.replace("__", "_")
-        ## "w_0_0_64x0e_1x0e"
-
-        # sanitized = sanitized.strip("_")
-        ## "w_0_0_64x0e_1x0e"
-
-        return f"weight_{sanitized}"
-        # "weight_w_0_0_64x0e_1x0e"
-
 
     def _build_name_mapping(self) -> Dict[str, str]:
         """Build mapping from original weight names to sanitized attribute names."""
@@ -434,7 +413,7 @@ class Linear(nnx.Module):
             assert weights is None, assertion_message
             output = _linear_vanilla(input, self._linear, get_parameter)
 
-        if self.linear_type == "indexed":
+        elif self.linear_type == "indexed":
             assert weights is not None, assertion_message
             if isinstance(weights, e3nn.IrrepsArray):
                 if not weights.irreps.is_scalar():

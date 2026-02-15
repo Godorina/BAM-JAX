@@ -59,10 +59,8 @@ def preprocess_graph(
         n_node=np.array([len(atoms)]).astype(np.int32),
         n_edge=np.array([len(src)]).astype(np.int32),
         nodes={
-            "species": np.array(
-                [atom_indices[n] for n in atoms.get_atomic_numbers()],
-            ).astype(np.int32),
-            "positions": atoms.positions,
+            "species": species,
+            "positions": atoms.positions.astype(np.float32),
             "forces": forces,
         },
         edges={

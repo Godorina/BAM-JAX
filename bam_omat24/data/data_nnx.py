@@ -106,10 +106,10 @@ def atoms_to_graph_with_targets(
         graph_e0 = node_e0.sum()
 
     energy = np.array([atoms.get_potential_energy() - graph_e0], dtype=np.float32)
-    forces = atoms.get_forces().astype(np.float32)
-    cell = np.array([atoms.get_cell()], dtype=np.float32)
+    forces = np.array(atoms.get_forces(), dtype=np.float32, copy=True)
+    cell = np.array(atoms.get_cell().array, dtype=np.float32)[np.newaxis]  # (1, 3, 3)
     volume = np.array([atoms.get_volume()], dtype=np.float32)
-    stress = np.array([atoms.get_stress()], dtype=np.float32)
+    stress = np.array(atoms.get_stress(), dtype=np.float32, copy=True)[np.newaxis]  # (1, 6)
 
     return jraph.GraphsTuple(
         n_node=np.array([len(atoms)], dtype=np.int32),

@@ -28,10 +28,10 @@ from ase.io import iread
 from scipy.optimize import minimize
 from tqdm import tqdm
 
-from bam_omat24.models.race_nnx import RACE
-from bam_omat24.data.data_nnx import Dataset, BucketedDataLoader, MultiDeviceDataLoader, atoms_to_graph
-from bam_omat24.training.losses import huber_loss, mae_loss, mse_loss, LOSS_FUNCTIONS
-from bam_omat24.training.sharding import (
+from bam.models.race_nnx import RACE
+from bam.data.data_nnx import Dataset, BucketedDataLoader, MultiDeviceDataLoader, atoms_to_graph
+from bam.training.losses import huber_loss, mae_loss, mse_loss, LOSS_FUNCTIONS
+from bam.training.sharding import (
     setup_mesh, replicate, replicate_pytree, squeeze_batch,
 )
 
@@ -482,7 +482,7 @@ def main():
     else:
         # ASE-readable format (traj, xyz, POSCAR, etc.) → convert to graph
         import tempfile
-        from bam_omat24.data.data_nnx import atoms_to_graph
+        from bam.data.data_nnx import atoms_to_graph
 
         print(f"  Converting {test_path.suffix} format to graph data...")
         traj = list(tqdm(iread(str(test_path), index=":"), desc="Reading test structures"))

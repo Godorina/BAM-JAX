@@ -1,7 +1,7 @@
 """RACE ASE Calculator for inference.
 
 Usage:
-    from bam_omat24.inference.calculator import RACECalculator
+    from bam.inference.calculator import RACECalculator
     calc = RACECalculator(model_path='ckpt_best.pkl', cutoff=6.0)
     atoms.calc = calc
     energy = atoms.get_potential_energy()
@@ -18,8 +18,8 @@ from flax import nnx
 
 from ase.calculators.calculator import Calculator, all_changes
 
-from bam_omat24.models.race_nnx import RACE
-from bam_omat24.data.data_nnx import atoms_to_graph, nearest_bucket
+from bam.models.race_nnx import RACE
+from bam.data.data_nnx import atoms_to_graph, nearest_bucket
 
 
 class RACECalculator(Calculator):
@@ -79,7 +79,7 @@ class RACECalculator(Calculator):
 
         if self.atom_energies is None:
             try:
-                from bam_omat24.data.atom_energies import ATOM_ENERGIES
+                from bam.data.atom_energies import ATOM_ENERGIES
                 self.atom_energies = ATOM_ENERGIES
             except ImportError:
                 self.atom_energies = np.zeros(120)

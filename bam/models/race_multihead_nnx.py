@@ -19,14 +19,14 @@ import jax
 import jax.numpy as jnp
 import jraph
 
-from bam_omat24.models.nequip_nnx import (
+from bam.models.nequip_nnx import (
     bessel_basis,
     polynomial_cutoff,
     separated_layer_norm,
     node_graph_idx,
 )
-from bam_omat24.models.linear_nnx import Linear as e3nn_nnx_Linear
-from bam_omat24.models.race_nnx import RACEXReadout, RACEConvolution
+from bam.models.linear_nnx import Linear as e3nn_nnx_Linear
+from bam.models.race_nnx import RACEXReadout, RACEConvolution
 
 
 class RACEConvolutionMultihead(RACEConvolution):
@@ -566,7 +566,7 @@ def load_foundation_as_multihead(
 
 if __name__ == "__main__":
     import numpy as np
-    from bam_omat24.data.atom_energies import ATOM_ENERGIES
+    from bam.data.atom_energies import ATOM_ENERGIES
 
     print("=" * 70)
     print("Multihead RACE Equivariance Test (Readout Expansion)")

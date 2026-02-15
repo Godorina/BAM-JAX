@@ -14,7 +14,7 @@ import numpy as np
 from flax import nnx
 from tqdm import tqdm
 
-from bam_omat24.data.atom_energies import ATOMIC_NUMBER_TO_INDEX
+from bam.data.atom_energies import ATOMIC_NUMBER_TO_INDEX
 
 
 def atoms_to_graph(
@@ -731,11 +731,11 @@ def print_bucket_batch_info(bucket_batch_info: dict,
 
 if __name__ == "__main__":
     from natsort import natsorted
-    from bam_omat24.training.sharding import setup_mesh
+    from bam.training.sharding import setup_mesh
 
     mesh, n_devices = setup_mesh()
 
-    train_path = Path('/home/willow/Python/BAM-nequip-main/bam_omat24')
+    train_path = Path('/home/willow/Python/BAM-nequip-main/bam')
     train_files_pkl = natsorted(list(train_path.glob('*.pkl')))
 
     rngs = nnx.Rngs(42)

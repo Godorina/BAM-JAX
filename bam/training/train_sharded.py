@@ -37,10 +37,10 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-from bam_omat24.data.data_nnx import Dataset, BucketedDataLoader, MultiDeviceDataLoader
-from bam_omat24.models.race_nnx import RACE
-from bam_omat24.training.losses import LOSS_FUNCTIONS
-from bam_omat24.training.sharding import (
+from bam.data.data_nnx import Dataset, BucketedDataLoader, MultiDeviceDataLoader
+from bam.models.race_nnx import RACE
+from bam.training.losses import LOSS_FUNCTIONS
+from bam.training.sharding import (
     setup_mesh, replicate, replicate_pytree,
     unreplicate, unreplicate_pytree, squeeze_batch,
     save_checkpoint, load_checkpoint,
@@ -757,7 +757,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
 if __name__ == "__main__":
     import sys
     import json
-    from bam_omat24.data.atom_energies import ATOM_ENERGIES
+    from bam.data.atom_energies import ATOM_ENERGIES
 
     import re
     def natsorted(lst):

@@ -3,9 +3,9 @@ requires = ["setuptools>=64,<75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bam-omat24"
+name = "bam"
 version = "0.1.0"
-description = "BAM-OMat24: JAX/Flax implementation of NequIP/RACE for periodic systems"
+description = "BAM: JAX/Flax implementation of NequIP/RACE for periodic systems"
 requires-python = ">=3.9"
 dependencies = [
     "jax",
@@ -25,4 +25,4 @@ dependencies = [
 fairchem = ["fairchem-core"]
 
 [tool.setuptools.packages.find]
-include = ["bam_omat24*"]
+include = ["bam*"]

@@ -13,7 +13,7 @@ build/
 *.pickle
 *.traj
 data/
-!bam_omat24/data/
+!bam/data/
 
 # Training outputs
 ckpt_*.pkl

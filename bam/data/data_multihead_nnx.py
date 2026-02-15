@@ -9,7 +9,7 @@ import numpy as np
 import jraph
 from flax import nnx
 
-from bam_omat24.data.data_nnx import Dataset
+from bam.data.data_nnx import Dataset
 
 
 class DatasetWithHead(Dataset):

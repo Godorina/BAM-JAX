@@ -39,8 +39,8 @@
         {
             "name": "target",
             "head_idx": 1,
-            "train_path": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam_omat24-260214/data/substrate_HER_train_cutoff_6.0.pkl",
-            "valid_path": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam_omat24-260214/data/substrate_HER_valid_cutoff_6.0.pkl"
+            "train_path": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam-260214/data/substrate_HER_train_cutoff_6.0.pkl",
+            "valid_path": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam-260214/data/substrate_HER_valid_cutoff_6.0.pkl"
         }
     ],
 

@@ -1,6 +1,6 @@
-"""NequIP model implementation using Flax NNX.
+"""RACE model implementation using Flax NNX.
 
-This module implements the NequIP (Neural Equivariant Interatomic Potential) model
+This module implements the RACE model
 using Flax NNX framework with e3nn_jax for equivariant operations.
 """
 
@@ -14,158 +14,82 @@ import jax
 import jax.numpy as jnp
 import jraph
 
-from bam_omat24.models.linear_nnx import Linear as e3nn_nnx_Linear
+from bam.models.nequip_nnx import (
+    bessel_basis,
+    polynomial_cutoff,
+    separated_layer_norm,
+    MLP,
+    node_graph_idx
+)
+from bam.models.linear_nnx import Linear as e3nn_nnx_Linear
 #import sys
 
-def bessel_basis(x: jax.Array, num_basis: int, r_max: jax.Array) -> jax.Array:
-    """Compute Bessel radial basis functions.
 
-    Args:
-        x: Distance array of shape (n_edges,)
-        num_basis: Number of basis functions
-        r_max: Cutoff radius
-
-    Returns:
-        Bessel basis values of shape (n_edges, num_basis)
-    """
-    r_max = r_max[:,None]
-    x = x[:,None]
-    prefactor = 2.0 / r_max
-    bessel_weights = jnp.linspace(1.0, num_basis, num_basis) * jnp.pi
-
-    return prefactor * jnp.where(
-        x == 0.0,
-        bessel_weights / r_max,
-        jnp.sin(bessel_weights * x / r_max) / x,
-    )
-
-
-def polynomial_cutoff(x: jax.Array, r_max: jax.Array, p: float) -> jax.Array:
-    """Compute polynomial cutoff function.
-
-    Args:
-        x: Distance array
-        r_max: Cutoff radius
-        p: Polynomial order
-
-    Returns:
-        Cutoff values (smoothly goes to zero at r_max)
-    """
-    factor = 1.0 / r_max
-    x = x * factor
-    out = 1.0
-    out = out - (((p + 1.0) * (p + 2.0) / 2.0) * jnp.power(x, p))
-    out = out + (p * (p + 2.0) * jnp.power(x, p + 1.0))
-    out = out - ((p * (p + 1.0) / 2) * jnp.power(x, p + 2.0))
-    return out * jnp.where(x < 1.0, 1.0, 0.0)
-
-
-def separated_layer_norm (
-    input: e3nn.IrrepsArray
-)->e3nn.IrrepsArray:
-
-    xi_s = jnp.zeros ( (input.shape[0], 1) )
-    cnt  = 0
-    for (mul, ir), chunk in zip (input.irreps, input.chunks):
-        if not ir.is_scalar():
-            xi = chunk.reshape(-1,mul*ir.dim)
-            xi_s += jnp.sum(xi**2, axis=-1, keepdims=True)
-            cnt  += mul*ir.dim
-    xi_rms_nonscalar = jnp.sqrt ( xi_s/jnp.maximum(cnt, 1) + 1e-6)
-
-    new_chunks = []
-    for (mul, ir), chunk in zip (input.irreps, input.chunks):
-        if ir.is_scalar():
-            xi = chunk.reshape(-1,mul)
-            xi_centered = xi - jnp.mean(xi, axis=-1, keepdims=True)
-            xi_rms_scalar = jnp.sqrt (jnp.mean(xi_centered**2, axis=-1, keepdims=True)+1e-6)
-            chunk = (xi_centered/xi_rms_scalar).reshape(-1, mul, ir.dim)
-        else:
-            xi = chunk.reshape(-1,mul*ir.dim)
-            chunk = (xi/xi_rms_nonscalar).reshape(-1, mul, ir.dim)
-
-        new_chunks.append(chunk)
-
-    return e3nn.from_chunks(
-        input.irreps,
-        new_chunks,
-        (input.shape[0],)
-    )
-
-class Linear(nnx.Module):
-    """Simple linear layer with optional bias."""
+class RACEXReadout(nnx.Module):
+    """RACE x_node_feature's readout layer with equivariant message passing."""
 
     def __init__(
         self,
-        in_size: int,
-        out_size: int,
-        use_bias: bool = True,
-        init_scale: float = 1.0,
-        *,
+        hidden_irreps: e3nn.Irreps,
+        output_irreps: e3nn.Irreps,
+        x_irreps: e3nn.Irreps,
+        n_species: int,
+        avg_n_neighbors: float,
         rngs: nnx.Rngs,
     ):
-        scale = math.sqrt(init_scale / in_size)
-        self.weights = nnx.Param(
-            jax.random.normal(rngs.params(), (in_size, out_size)) * scale
+        self.x_readout1 = e3nn_nnx_Linear(
+            irreps_in=x_irreps,
+            irreps_out=hidden_irreps,
+            linear_type="indexed",
+            num_indexed_weights=n_species,
+            force_irreps_out=True,
+            rngs=rngs,
         )
-        self.use_bias = use_bias
-        self.bias: nnx.Param[jax.Array] | None
-        if use_bias:
-            self.bias = nnx.Param(jnp.zeros(out_size))
-        else:
-            self.bias = None
+        self.x_readout2 = e3nn_nnx_Linear(
+            irreps_in=hidden_irreps,
+            irreps_out=hidden_irreps//2,
+            biases=True, # willow
+            rngs=rngs,
+            force_irreps_out=True,
+        )
+        self.x_readout3 = e3nn_nnx_Linear(
+            irreps_in=hidden_irreps//2,
+            irreps_out=output_irreps,
+            biases=True, # willow
+            rngs=rngs,
+            force_irreps_out=True,
+        )
+        self.avg_n_neighbors = avg_n_neighbors
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        x = jnp.dot(x, self.weights[...])
-        if self.use_bias:
-            x = x + self.bias[...]
-        return x
-
-
-class MLP(nnx.Module):
-    """Multi-layer perceptron with configurable activation."""
-
-    def __init__(
+    def __call__(
         self,
-        sizes: Sequence[int],
-        activation: Callable = jax.nn.silu,
-        init_scale: float = 1.0,
-        use_bias: bool = False,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.activation = activation
-        layers = []
+        species: jax.Array,
+        x_feats: e3nn.IrrepsArray,
+    ) -> e3nn.IrrepsArray:
 
-        for i in range(len(sizes) - 1):
-            layer = Linear(
-                sizes[i],
-                sizes[i + 1],
-                use_bias=use_bias,
-                # don't scale last layer since no activation
-                init_scale=init_scale if i < len(sizes) - 2 else 1.0,
-                rngs=rngs,
-            )
-            layers.append(layer)
+        x_feats_norm = separated_layer_norm (x_feats)/jnp.sqrt(self.avg_n_neighbors)
+        x_features = self.x_readout1(species, x_feats_norm)
+        x_features = self.x_readout2(x_features)
+        x_features = e3nn.gate(
+            x_features,
+            even_act=jax.nn.silu,
+            odd_act=jax.nn.sigmoid,
+            even_gate_act=jax.nn.silu,
+        )
+        #x_features = e3nn.scalar_activation(x_features, [jax.nn.silu])
+        x_energy = self.x_readout3(x_features)
 
-        self.layers = nnx.List(layers)
-        #self.layers = layers
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i < len(self.layers) - 1:
-                x = self.activation(x)
-        return x
+        return x_energy
 
 
-class NequipConvolution(nnx.Module):
-    """NequIP convolution layer with equivariant message passing."""
+class RACEConvolution(nnx.Module):
+    """RACE convolution layer with equivariant message passing."""
 
     def __init__(
         self,
         input_irreps: e3nn.Irreps,
         output_irreps: e3nn.Irreps,
+        x_irreps: e3nn.Irreps,
         sh_irreps: e3nn.Irreps,
         n_species: int,
         radial_basis_size: int,
@@ -221,9 +145,24 @@ class NequipConvolution(nnx.Module):
             rngs=rngs,
         )
 
+        output_irreps_2 = output_irreps//2
+        self.readout1 = e3nn_nnx_Linear(
+            irreps_in=output_irreps,
+            irreps_out=output_irreps_2,
+            biases=True, # willow
+            rngs=rngs,
+        )
+        self.readout = e3nn_nnx_Linear(
+            irreps_in=output_irreps_2,
+            irreps_out=e3nn.Irreps("0e"),
+            biases=True, # willow
+            rngs=rngs,
+        )
+
     def __call__(
         self,
         features: e3nn.IrrepsArray,
+        x_feats: e3nn.IrrepsArray,
         species: jax.Array,
         sh: e3nn.IrrepsArray,
         radial_basis: jax.Array,
@@ -241,22 +180,29 @@ class NequipConvolution(nnx.Module):
             messages, dst=receivers, output_size=features.shape[0]
         ) / jnp.sqrt(self.avg_n_neighbors)
 
+        messages_agg = e3nn.tensor_product(
+            messages_agg,
+            x_feats,
+            filter_ir_out=self.output_irreps
+        )
         features = self.linear_2(messages_agg) + self.skip(species, features)
 
         # follow equiformer
-        return e3nn.gate(
+        features = e3nn.gate(
             features,
             even_act=jax.nn.silu,
             odd_act=jax.nn.sigmoid,
             even_gate_act=jax.nn.silu,
         )
 
+        node_energies = self.readout1(features)
+        node_energies = self.readout(node_energies)
 
-class Nequip(nnx.Module):
-    """NequIP model for predicting energies and forces.
+        return node_energies, features
 
-    Neural Equivariant Interatomic Potential using E(3)-equivariant
-    graph neural networks.
+
+class RACE(nnx.Module):
+    """RACE model for predicting energies and forces.
 
     Args:
         n_species: Number of atom species
@@ -317,8 +263,25 @@ class Nequip(nnx.Module):
 
         hidden_irreps = e3nn.Irreps(hidden_irreps)
         input_irreps = hidden_irreps.filter(keep="0e")
+        x_irreps = e3nn.Irreps("1x0e")
+        self.x_linear = e3nn_nnx_Linear(
+            irreps_in=input_irreps,
+            irreps_out=x_irreps,
+            linear_type="indexed",
+            num_indexed_weights=n_species,
+            force_irreps_out=True,
+            rngs=rngs,
+        )
+
+        # 초기화 때 일어나는 일:
+        # "64→1 변환이고 원소 89종류니까 weight shape은 (89, 64, 1)이겠네"
+        # → jax.random.normal로 (89, 64, 1) 랜덤 행렬 생성
+        # → nnx.Param으로 저장
+        # 끝. 실제 계산은 안 함
+
         sh_irreps = e3nn.s2_irreps(lmax)
-        
+        # 초기화 시점에서는 그냥 "1x0e + 1x1o + 1x2e + 1x3o"라는 타입 정보만 저장해두는 거.
+        # RACEConvolution에 넘겨서 weight shape 계산에 쓰임.
 
         self.species_embedding = e3nn_nnx_Linear(
             irreps_in=e3nn.Irreps(f"{n_species}x0e"),
@@ -327,10 +290,13 @@ class Nequip(nnx.Module):
         )
 
         layers = []
+        x_readouts = []
+        f_readouts = []
         for i in range(n_layers):
-            layer = NequipConvolution(
+            layer = RACEConvolution(
                 input_irreps=input_irreps if i == 0 else hidden_irreps,
                 output_irreps=hidden_irreps,
+                x_irreps=x_irreps,
                 sh_irreps=sh_irreps,
                 n_species=n_species,
                 radial_basis_size=radial_basis_size,
@@ -342,22 +308,30 @@ class Nequip(nnx.Module):
             )
             layers.append(layer)
 
-        self.layers = nnx.List(layers)
-        #self.layers = layers
+            x_readout = RACEXReadout(
+                hidden_irreps=e3nn.Irreps("64x0e"), # 256
+                output_irreps=e3nn.Irreps("0e"),
+                x_irreps=x_irreps,
+                n_species=n_species,
+                avg_n_neighbors=avg_n_neighbors,
+                rngs=rngs,
+            )
+            x_readouts.append(x_readout)
 
-        hidden_irreps_2 = (hidden_size//2) * e3nn.s2_irreps(lmax)
-        self.readout1 = e3nn_nnx_Linear(
-            irreps_in=hidden_irreps,
-            irreps_out=hidden_irreps_2,
-            biases=True, # willow
-            rngs=rngs,
-        )
-        self.readout = e3nn_nnx_Linear(
-            irreps_in=hidden_irreps_2,
-            irreps_out=e3nn.Irreps("0e"),
-            biases=True, # willow
-            rngs=rngs,
-        )
+            f_readout = RACEXReadout(
+                hidden_irreps=e3nn.Irreps("64x0e"), # 256
+                output_irreps=e3nn.Irreps("0e"),
+                x_irreps=input_irreps if i == 0 else hidden_irreps,
+                n_species=n_species,
+                avg_n_neighbors=avg_n_neighbors,
+                rngs=rngs,
+            )
+            f_readouts.append (f_readout)
+
+        self.layers = nnx.List(layers)
+        self.x_readouts = nnx.List(x_readouts)
+        self.f_readouts = nnx.List(f_readouts)
+
 
     def node_energies(self,
                       positions: jax.Array,
@@ -381,6 +355,7 @@ class Nequip(nnx.Module):
             jax.nn.one_hot(data.nodes["species"], self.n_species),
         )
         features = self.species_embedding (features)
+        x_feats = self.x_linear(data.nodes['species'], features)
 
         if self.periodic:
             # --- Periodic (condensed phase) ---
@@ -412,7 +387,7 @@ class Nequip(nnx.Module):
             cutoff_per_edge = jnp.full((num_edges,), self.cutoff)
 
         cutoff_per_edge = jnp.where(cutoff_per_edge > 1.0, cutoff_per_edge, 1.0)
-        cutoff_per_edge = cutoff_per_edge.squeeze() # [n_edges,]
+        cutoff_per_edge = cutoff_per_edge.reshape(-1) # [n_edges,]
 
         # safe norm (avoids nan for r = 0)
         square_r_norm = jnp.sum(r**2, axis=-1)
@@ -435,18 +410,37 @@ class Nequip(nnx.Module):
             normalization="component",
         )
 
-        for layer in self.layers:
-            features = layer(
+        outputs = []
+        for (layer, x_readout, f_readout) in zip(
+            self.layers,
+            self.x_readouts,
+            self.f_readouts):
+            f_energy = f_readout(
+                data.nodes["species"],
+                features
+            )
+            node_energies, features = layer(
                 features,
+                x_feats,
                 data.nodes["species"],
                 sh,
                 radial_basis,
                 data.senders,
                 data.receivers,
             )
+            x_energy = x_readout(
+                data.nodes["species"],
+                x_feats)
+            outputs += [node_energies.array[:,0]
+                        + x_energy.array[:, 0]
+                        + f_energy.array[:, 0]]
 
-        features = self.readout1(features)
-        node_energies = self.readout(features)
+        node_energies = jnp.sum(
+            jnp.stack(outputs, axis=1),
+            axis=-1,
+            keepdims=True
+        )
+        node_energies = e3nn.IrrepsArray(e3nn.Irreps("0e"), node_energies)
 
         # scale and shift energies
         node_energies = node_energies * (
@@ -497,7 +491,6 @@ class Nequip(nnx.Module):
 
         if not self.l_train:
             # add isolated atom energies to each node as prior
-            # to predict energies of testing dataset. [in which no energy/forces are provided]
             node_energies = node_energies + jax.lax.stop_gradient(
                 self.atom_energies[...][data.nodes["species"], None]
             )
@@ -509,6 +502,7 @@ class Nequip(nnx.Module):
             # For padded batches, use jraph's mask (last graph is padding)
             node_mask = jraph.get_node_padding_mask(data)[:, None]
             grad = jnp.where(node_mask, grad, 0.0)
+            node_energies = jnp.where(node_mask, node_energies, 0.0)
         # For single graphs, no masking needed (all nodes are valid)
 
         # Handle any NaN forces from numerical issues
@@ -548,66 +542,29 @@ class Nequip(nnx.Module):
         return graph_energies[:, 0], -grad, stress
 
 
-def node_graph_idx(data: jraph.GraphsTuple) -> jnp.ndarray:
-    """Returns the index of the graph for each node."""
-    n_graph = data.n_node.shape[0]
-    sum_n_node = jax.tree_util.tree_leaves(data.nodes)[0].shape[0]
-    graph_idx = jnp.arange(n_graph)
-    node_gr_idx = jnp.repeat(
-        graph_idx, data.n_node, axis=0, total_repeat_length=sum_n_node
-    )
-    return node_gr_idx
-
-
-
 
 if __name__ == "__main__":
     # Example usage
     import numpy as np
     import pickle
+    from bam.data.atom_energies import ATOM_ENERGIES
     #from ase.io import read
 
     print("=" * 70)
-    print("Nequip-Style Equivariant Potential")
+    print("RACE-Style Equivariant Potential")
     print("=" * 70)
 
-    """
-    uniq_element = {z: i for i, z in enumerate([1, 6, 7, 8])}
-    #enr_avg_per_element = {i: -654.09 for i in range(4)}
-    enr_avg_per_element = {
-        1: -13.587222780835477,
-        6: -1029.4889999855063,
-        7: -1484.9814568572233,
-        8: -2041.9816003861047,
-    }
-
-    # Load data
-    atoms = read('dataset_3BPA/train_300K.xyz', index=0)
-    graphset = get_graphset(
-        [atoms],
-        cutoff=5.0,
-        nbatch=1,
-        uniq_element=uniq_element,
-        enr_avg_per_element=enr_avg_per_element
-    )
-    """
     #data = graphset[0]
     with open('omat24_val_0.pkl', 'rb') as f:
         graphset = pickle.load (f)
     data = graphset[0]
 
-    lines = open('atom_energies.dat', 'r').readlines()
-    atom_energies = []
-    for line in lines:
-        key = line.split()
-        atom_energies.append (float(key[1]))
-
     # Create model
     rngs = nnx.Rngs(42)
-    model = Nequip(
-        n_species=len(atom_energies),
+    model = RACE(
+        n_species=len(ATOM_ENERGIES),
         lmax=3,
-        hidden_size=128,
+        hidden_irreps="64x0e + 64x1o + 64x2e",
         n_layers=3,
         radial_basis_size=8,
         radial_mlp_size=64,
@@ -616,7 +573,9 @@ if __name__ == "__main__":
         shift = 0.0,
         scale = 1.0,
         avg_n_neighbors=25,
-        atom_energies=atom_energies,
+        atom_energies=ATOM_ENERGIES,
+        l_train=True,
+        periodic=True,
         rngs=rngs,
     )
 
@@ -636,4 +595,3 @@ if __name__ == "__main__":
     print(f"stress", stress)
     print(f"Target energies", data.globals['energy'])
     print ('target stress', data.globals['stress'], 'eV/A^3')
-

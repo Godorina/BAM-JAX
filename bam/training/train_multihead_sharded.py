@@ -25,11 +25,11 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-from bam_omat24.data.data_nnx import BucketedDataLoader, MultiDeviceDataLoader
-from bam_omat24.data.data_multihead_nnx import DatasetWithHead
-from bam_omat24.models.race_multihead_nnx import RACEMultihead, load_foundation_as_multihead
-from bam_omat24.training.losses import LOSS_FUNCTIONS
-from bam_omat24.training.sharding import (
+from bam.data.data_nnx import BucketedDataLoader, MultiDeviceDataLoader
+from bam.data.data_multihead_nnx import DatasetWithHead
+from bam.models.race_multihead_nnx import RACEMultihead, load_foundation_as_multihead
+from bam.training.losses import LOSS_FUNCTIONS
+from bam.training.sharding import (
     setup_mesh, replicate, replicate_pytree,
     unreplicate, unreplicate_pytree, squeeze_batch,
     save_checkpoint, load_checkpoint,
@@ -737,7 +737,7 @@ if __name__ == "__main__":
     import sys
     import json
     from pathlib import Path
-    from bam_omat24.data.atom_energies import ATOM_ENERGIES
+    from bam.data.atom_energies import ATOM_ENERGIES
 
     print("=" * 70)
     print("JAX Multihead Sharded Training (Multi-GPU)")

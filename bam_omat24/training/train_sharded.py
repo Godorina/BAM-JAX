@@ -424,13 +424,28 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
     opt_state = optimizer.init(params)
     schedule_state = schedule.init(params)
 
-    # Replicate across devices
-    params = replicate_pytree(params, mesh)
-    ema_params = replicate_pytree(ema_params, mesh)
-    opt_state = replicate_pytree(opt_state, mesh)
-    schedule_state = replicate_pytree(schedule_state, mesh)
+    # Load checkpoint if exists, otherwise replicate initial params
+    best_val_loss = float('inf')
+    if config.get('restart', False) and Path('ckpt_best.pkl').exists():
+        ckpt = load_checkpoint('ckpt_best.pkl')
+        # Free initial params before loading checkpoint to save GPU memory
+        del params, ema_params, opt_state, schedule_state
+        params = replicate_pytree(ckpt['params'], mesh)
+        ema_params = replicate_pytree(ckpt['ema_params'], mesh)
+        opt_state = replicate_pytree(ckpt['opt_state'], mesh)
+        schedule_state = replicate_pytree(ckpt['schedule_state'], mesh)
+        step = replicate(jnp.array(ckpt.get('step', 0)), mesh)
+        best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        del ckpt
+        print(f"Resumed from step {jax.device_get(step).item()}", file=fout)
+    else:
+        # Replicate across devices
+        params = replicate_pytree(params, mesh)
+        ema_params = replicate_pytree(ema_params, mesh)
+        opt_state = replicate_pytree(opt_state, mesh)
+        schedule_state = replicate_pytree(schedule_state, mesh)
+        step = replicate(jnp.array(0), mesh)
 
-    step = replicate(jnp.array(0), mesh)
     energy_weight=config.get('energy_weight', 1.0)
     force_weight=config.get('force_weight', 1.0)
     stress_weight=config.get('stress_weight', 1.0)
@@ -445,18 +460,6 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
         huber_delta=huber_delta,
         ema_decay=config.get('ema_decay', 0.99)
     )
-
-    # Load checkpoint if exists
-    best_val_loss = float('inf')
-    if config.get('restart', False) and Path('ckpt_best.pkl').exists():
-        ckpt = load_checkpoint('ckpt_best.pkl')
-        params = replicate_pytree(ckpt['params'], mesh)
-        ema_params = replicate_pytree(ckpt['ema_params'], mesh)
-        opt_state = replicate_pytree(ckpt['opt_state'], mesh)
-        schedule_state = replicate_pytree(ckpt['schedule_state'], mesh)
-        step = replicate(jnp.array(ckpt.get('step', 0)), mesh)
-        best_val_loss = ckpt.get('best_val_loss', float('inf'))
-        print(f"Resumed from step {ckpt.get('step', 0)}", file=fout)
 
     # Training loop
     best_state = None

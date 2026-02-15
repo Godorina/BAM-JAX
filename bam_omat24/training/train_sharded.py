@@ -18,6 +18,8 @@ Both training AND evaluation are sharded across all GPUs.
 #os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 
 from typing import Dict, Tuple, List, Any
+import json
+import pickle
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
@@ -366,6 +368,116 @@ def evaluate_sharded(
 
 
 # =============================================================================
+# Prediction / Evaluation
+# =============================================================================
+
+def predict_sharded(config: Dict):
+    """Run evaluation using checkpoint and config."""
+    predict_config = config.get('predict', {})
+    ckpt_path = Path(predict_config.get('model', 'ckpt_best.pkl'))
+    test_path = Path(predict_config.get('test_path', config.get('test_path', '')))
+
+    if not ckpt_path.exists():
+        print(f"Checkpoint not found: {ckpt_path}")
+        return
+    if not test_path.exists():
+        print(f"Test data not found: {test_path}")
+        return
+
+    # Setup
+    mesh, n_devices = setup_mesh()
+
+    # Load checkpoint
+    print(f"Loading checkpoint from {ckpt_path}...")
+    ckpt = load_checkpoint(str(ckpt_path))
+
+    # Use config from checkpoint if available
+    if 'config' in ckpt:
+        print("Using config from checkpoint")
+        model_config = ckpt['config']
+    else:
+        model_config = config
+
+    # Create model (for graphdef)
+    print("Creating model...")
+    model = RACE(
+        n_species=len(model_config["atom_energies"]),
+        lmax=model_config["lmax"],
+        hidden_irreps=model_config["hidden_irreps"],
+        n_layers=model_config["n_layers"],
+        radial_basis_size=model_config["radial_basis_size"],
+        radial_mlp_size=model_config["radial_mlp_size"],
+        radial_mlp_layers=model_config["radial_mlp_layers"],
+        radial_polynomial_p=model_config["radial_polynomial_p"],
+        mlp_init_scale=model_config["mlp_init_scale"],
+        shift=0.0,
+        scale=1.0,
+        avg_n_neighbors=model_config.get("avg_n_neighbors", 25.0),
+        atom_energies=model_config["atom_energies"],
+        l_train=False,
+        rngs=nnx.Rngs(42)
+    )
+    graphdef, _ = nnx.split(model, nnx.Param)
+
+    # Use EMA params if available
+    if 'ema_params' in ckpt:
+        print("Using EMA parameters")
+        params = ckpt['ema_params']
+    else:
+        print("Using regular parameters")
+        params = ckpt['params']
+
+    print(f"Checkpoint step: {ckpt.get('step', 'N/A')}")
+    print(f"Checkpoint epoch: {ckpt.get('epoch', 'N/A')}")
+    print(f"Checkpoint best_val_loss: {ckpt.get('best_val_loss', 'N/A')}")
+    del ckpt
+
+    # Load test dataset
+    print(f"\nLoading test dataset from {test_path}...")
+    test_dataset = Dataset(file_path=str(test_path))
+
+    print(f"Test dataset: {len(test_dataset)} graphs")
+
+    # Run evaluation
+    print("\n" + "=" * 70)
+    print("Running Evaluation")
+    print("=" * 70)
+
+    metrics = evaluate_sharded(
+        graphdef=graphdef,
+        params=params,
+        files_pkl=[str(test_path)],
+        batch_size=model_config.get('batch_size', 4),
+        n_devices=n_devices,
+        mesh=mesh,
+        energy_weight=model_config.get('energy_weight', 1.0),
+        force_weight=model_config.get('force_weight', 1.0),
+        stress_weight=model_config.get('stress_weight', 1.0),
+        huber_delta=model_config.get('huber_delta', 0.02)
+    )
+
+    # Print results
+    print("\n" + "=" * 70)
+    print("Evaluation Results")
+    print("=" * 70)
+    print(f"Total graphs: {metrics['n_graphs']}")
+    print(f"Total atoms:  {metrics['n_atoms']}")
+    print()
+    print(f"Total Loss:   {metrics['total_loss']:.6f}")
+    print()
+    print(f"Energy MAE: {metrics['energy_mae']:.6f} eV/atom")
+    print(f"Force  MAE: {metrics['force_mae']:.6f} eV/A")
+    print(f"Stress MAE: {metrics['stress_mae']:.6f} eV/A^3")
+    print("=" * 70)
+
+    # Save results
+    results_path = Path('eval_results.json')
+    with open(results_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"\nResults saved to {results_path}")
+
+
+# =============================================================================
 # Main Training Loop
 # =============================================================================
 
@@ -436,8 +548,9 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
         schedule_state = replicate_pytree(ckpt['schedule_state'], mesh)
         step = replicate(jnp.array(ckpt.get('step', 0)), mesh)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        start_epoch = ckpt.get('epoch', 0)
         del ckpt
-        print(f"Resumed from step {jax.device_get(step).item()}", file=fout)
+        print(f"Resumed from epoch {start_epoch+1}, step {jax.device_get(step).item()}", file=fout)
     else:
         # Replicate across devices
         params = replicate_pytree(params, mesh)
@@ -445,6 +558,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
         opt_state = replicate_pytree(opt_state, mesh)
         schedule_state = replicate_pytree(schedule_state, mesh)
         step = replicate(jnp.array(0), mesh)
+        start_epoch = 0
 
     energy_weight=config.get('energy_weight', 1.0)
     force_weight=config.get('force_weight', 1.0)
@@ -465,7 +579,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
     best_state = None
     #n_val = 0
 
-    for epoch in range(config["n_epochs"]):
+    for epoch in range(start_epoch, config["n_epochs"]):
         epoch_start = time.time()
 
         pbar_files = tqdm(enumerate(train_files_pkl), total=len(train_files_pkl),
@@ -603,8 +717,10 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
                     'opt_state': unreplicate_pytree(opt_state),
                     'schedule_state': new_schedule,
                     'step': int(np.asarray(step)),
+                    'epoch': epoch,
                     'best_val_loss': best_val_loss,
                     'metrics': val_metrics,
+                    'config': config,
                 }
                 print(f"  *** New best val loss: {best_val_loss:.6f} "
                       f"(improved by {improvement:.6f}) ***", file=fout)
@@ -647,8 +763,6 @@ if __name__ == "__main__":
 
 
     print("=" * 70)
-    print("JAX Sharded Training (Multi-GPU)")
-    print("=" * 70)
     print(f"JAX version: {jax.__version__}")
     print(f"Devices: {jax.devices()}")
     print(f"Device count: {jax.local_device_count()}")
@@ -659,23 +773,33 @@ if __name__ == "__main__":
         config = json.load(f)
     config['atom_energies'] = ATOM_ENERGIES
 
-    train_path = Path('/dataset/usr004/hgpark/jax_omat_data/train_pkl')
-    valid_path = Path('/dataset/usr004/hgpark/jax_omat_data/val_pkl')
+    # Branch: predict (eval) or train
+    predict_config = config.get('predict', {})
+    if predict_config.get('evaluate_tag', False):
+        print("Mode: Evaluation")
+        print("=" * 70)
+        predict_sharded(config)
+    else:
+        print("Mode: Training")
+        print("=" * 70)
 
-    print("Scanning for pickle files...")
-    train_files = natsorted(list(train_path.glob('omat*.pkl')))
-    valid_files = natsorted(list(valid_path.glob('omat*.pkl')))
+        train_path = Path('/dataset/usr004/hgpark/jax_omat_data/train_pkl')
+        valid_path = Path('/dataset/usr004/hgpark/jax_omat_data/val_pkl')
 
-    print(f"Training files: {len(train_files)}")
-    for i, f in enumerate(train_files[:5]):
-        print(f"  [{i}] {f.name}")
-    if len(train_files) > 5:
-        print(f"  ... and {len(train_files) - 5} more files")
+        print("Scanning for pickle files...")
+        train_files = natsorted(list(train_path.glob('omat*.pkl')))
+        valid_files = natsorted(list(valid_path.glob('omat*.pkl')))
 
-    print(f"Validation files: {len(valid_files)}")
-    for i, f in enumerate(valid_files[:3]):
-        print(f"  [{i}] {f.name}")
-    if len(valid_files) > 3:
-        print(f"  ... and {len(valid_files) - 3} more files")
+        print(f"Training files: {len(train_files)}")
+        for i, f in enumerate(train_files[:5]):
+            print(f"  [{i}] {f.name}")
+        if len(train_files) > 5:
+            print(f"  ... and {len(train_files) - 5} more files")
 
-    train_sharded(config, train_files, valid_files)
+        print(f"Validation files: {len(valid_files)}")
+        for i, f in enumerate(valid_files[:3]):
+            print(f"  [{i}] {f.name}")
+        if len(valid_files) > 3:
+            print(f"  ... and {len(valid_files) - 3} more files")
+
+        train_sharded(config, train_files, valid_files)

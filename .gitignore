@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# Data & Checkpoints
+*.pkl
+*.pickle
+*.traj
+data/
+
+# Training outputs
+ckpt_*.pkl
+*.out
+*.log
+eval_log.txt
+eval_results.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

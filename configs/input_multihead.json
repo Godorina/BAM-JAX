@@ -1,0 +1,44 @@
+{
+    "foundation_ckpt": "/path/to/foundation/ckpt_best.pkl",
+
+    "lmax": 3,
+    "hidden_irreps": "64x0e + 64x1o + 64x2e",
+    "n_layers": 5,
+    "radial_basis_size": 8,
+    "radial_mlp_size": 64,
+    "radial_mlp_layers": 3,
+    "radial_polynomial_p": 2.0,
+    "mlp_init_scale": 4.0,
+
+    "learning_rate": 0.0005,
+    "batch_size": 10,
+    "n_epochs": 100,
+    "energy_weight": 1.0,
+    "force_weight": 100.0,
+    "stress_weight": 1.0,
+    "huber_delta": 0.02,
+    "ema_decay": 0.99,
+
+    "lr_schedule_patience": 10,
+    "lr_schedule_factor": 0.5,
+    "lr_schedule_min_scale": 0.01,
+
+    "seed": 42,
+    "restart": false,
+    "fname_log": "loss_multihead.out",
+
+    "heads": [
+        {
+            "name": "replay",
+            "head_idx": 0,
+            "train_path": "/path/to/replay/train_pkl",
+            "valid_path": "/path/to/replay/val_pkl"
+        },
+        {
+            "name": "target",
+            "head_idx": 1,
+            "train_path": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam_omat24-260214/data/substrate_HER_train_cutoff_6.0.pkl",
+            "valid_path": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam_omat24-260214/data/substrate_HER_valid_cutoff_6.0.pkl"
+        }
+    ]
+}

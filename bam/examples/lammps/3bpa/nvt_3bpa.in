@@ -1,0 +1,63 @@
+# BAM-NequIP LAMMPS NVT Simulation
+# 3BPA C12H12N2O, 27 atoms/cell, 100 ps
+# Atom types = atomic numbers: H(1), C(6), N(7), O(8)
+#
+# Usage (new):
+#   lmp -in nvt_3bpa.in                                    # default 1x1x1
+#   lmp -in nvt_3bpa.in -var RX 4 -var RY 3 -var RZ 2     # 4x3x2
+#
+# Usage (restart):
+#   lmp -in nvt_3bpa.in -var RESTART 1 -var RESTART_FILE restart.b.bin
+
+variable        RX index 1
+variable        RY index 1
+variable        RZ index 1
+variable        RESTART index 0
+variable        RESTART_FILE index restart.b.bin
+
+units           metal
+atom_style      atomic
+boundary        p p p
+
+# --- New run: read structure and replicate ---
+if "${RESTART} == 0" then &
+    "read_data 3bpa_structure.data" &
+    "replicate ${RX} ${RY} ${RZ}"
+
+# --- Restart: restore from restart file ---
+if "${RESTART} == 1" then &
+    "read_restart ${RESTART_FILE}"
+
+pair_style      chemtrain_deploy cuda12 0.95
+pair_coeff      * * ../model-lammps.ptb 1.1 1.5
+
+# pair cutoff(6.0) + skin(1.0) = 7.0
+comm_modify     cutoff 7.0
+
+neighbor        1.0 bin
+neigh_modify    every 1 delay 0 check yes
+
+# Initialize velocities only for new run
+if "${RESTART} == 0" then &
+    "velocity all create 300.0 12345 mom yes rot yes"
+
+# NVT: Nose-Hoover T=300K, Tdamp=0.1 ps
+fix             1 all nvt temp 300.0 300.0 0.1
+timestep        0.001
+
+thermo          100
+thermo_style    custom step temp pe ke etotal press vol atoms
+
+# Trajectory output (every 0.1 ps = 100 steps)
+dump            1 all custom 100 dump.lammpstrj id type x y z fx fy fz
+dump_modify     1 sort id format float %20.15g
+if "${RESTART} == 1" then &
+    "dump_modify 1 append yes"
+
+# Save restart every 10000 steps (rolling 2 files)
+restart         10000 restart.a.bin restart.b.bin
+
+# 100 ps = 100000 steps (timestep 0.001 ps)
+run             100000
+
+print           "=== DONE: 3BPA ${RX}x${RY}x${RZ} NVT 100ps ==="

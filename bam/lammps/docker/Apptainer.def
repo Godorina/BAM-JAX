@@ -1,0 +1,24 @@
+# BAM-JAX LAMMPS Apptainer definition (HPC clusters)
+#
+# Build:
+#   apptainer build bam-lammps.sif Apptainer.def
+#
+# Run:
+#   apptainer exec --nv bam-lammps.sif lmp -in input.lammps
+#
+# With SLURM:
+#   srun apptainer exec --nv bam-lammps.sif lmp -in input.lammps
+
+Bootstrap: docker
+From: bam-lammps:latest
+
+%labels
+    Author BAM-NequIP
+    Version 1.0
+
+%environment
+    export PATH="/opt/bam-lammps/bin:${PATH}"
+    export LD_LIBRARY_PATH="/opt/bam-lammps/lib:${LD_LIBRARY_PATH}"
+
+%runscript
+    exec lmp "$@"

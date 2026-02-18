@@ -19,6 +19,7 @@ Both training AND evaluation are sharded across all GPUs.
 
 from typing import Callable, Dict, Tuple, List, Any
 from functools import partial
+from datetime import datetime
 import json
 import pickle
 import jax
@@ -416,6 +417,7 @@ def predict_sharded(config: Dict):
         avg_n_neighbors=model_config.get("avg_n_neighbors", 25.0),
         atom_energies=model_config["atom_energies"],
         l_train=False,
+        use_checkpoint=model_config.get('use_checkpoint', False),
         rngs=nnx.Rngs(42)
     )
     graphdef, _ = nnx.split(model, nnx.Param)
@@ -483,6 +485,79 @@ def predict_sharded(config: Dict):
 
 
 # =============================================================================
+# Batch Logger
+# =============================================================================
+
+class BatchLogger:
+    """Logger for tracking batch sizes per GPU."""
+
+    def __init__(self, n_devices: int, log_root: str = "batch_logs"):
+        self.n_devices = n_devices
+        self.log_root = Path(log_root)
+
+        self.gpu_logs = {}
+        self.batch_logs = {}
+
+        for gpu_id in range(n_devices):
+            log_dir = self.log_root / f"rank_{gpu_id}"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            gpu_log_path = log_dir / f"gpu{gpu_id}.log"
+            self.gpu_logs[gpu_id] = open(gpu_log_path, 'w')
+
+            batch_log_path = log_dir / "batch_sizes.log"
+            self.batch_logs[gpu_id] = open(batch_log_path, 'w')
+            self.batch_logs[gpu_id].write(
+                "# timestamp,epoch,mode,file,batch_idx,"
+                "n_graphs,n_nodes,n_edges,graph_indices\n"
+            )
+            self.batch_logs[gpu_id].flush()
+
+            self._log_gpu_single(gpu_id, f"Initialized - GPU {gpu_id}")
+
+        print(f"Created batch logs for {n_devices} GPUs in {log_root}/")
+
+    def _log_gpu_single(self, gpu_id: int, message: str):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.gpu_logs[gpu_id].write(f"[{timestamp}] {message}\n")
+        self.gpu_logs[gpu_id].flush()
+
+    def log_gpu(self, message: str):
+        for gpu_id in range(self.n_devices):
+            self._log_gpu_single(gpu_id, message)
+
+    def log_batch(self, epoch: int, mode: str, file_name: str,
+                  batch_idx: int, batch_info):
+        """Log batch info from MultiDeviceBatchInfo."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for gpu_id in range(self.n_devices):
+            n_graphs = int(batch_info.n_graphs_per_device[gpu_id])
+            n_nodes = int(batch_info.n_nodes_per_device[gpu_id])
+            n_edges = int(batch_info.n_edges_per_device[gpu_id])
+
+            if (batch_info.graph_indices_per_device and
+                    gpu_id < len(batch_info.graph_indices_per_device)):
+                indices = batch_info.graph_indices_per_device[gpu_id]
+                indices_str = "[" + ",".join(map(str, indices)) + "]"
+            else:
+                indices_str = "[]"
+
+            line = (f"{timestamp},{epoch},{mode},{file_name},"
+                    f"{batch_idx},{n_graphs},{n_nodes},{n_edges},{indices_str}\n")
+            self.batch_logs[gpu_id].write(line)
+            self.batch_logs[gpu_id].flush()
+
+    def close(self):
+        for gpu_id in range(self.n_devices):
+            if gpu_id in self.gpu_logs and not self.gpu_logs[gpu_id].closed:
+                self.gpu_logs[gpu_id].close()
+            if gpu_id in self.batch_logs and not self.batch_logs[gpu_id].closed:
+                self.batch_logs[gpu_id].close()
+        print(f"Closed all batch log files")
+
+
+# =============================================================================
 # Main Training Loop
 # =============================================================================
 
@@ -492,6 +567,11 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
     # Setup
     mesh, n_devices = setup_mesh()
     fout = open(config.get('fname_log', 'loss_sharded.out'), 'w', 1)
+
+    batch_logger = BatchLogger(
+        n_devices=n_devices,
+        log_root=config.get('batch_log_root', 'batch_logs'),
+    )
 
     print("=" * 70, file=fout)
     print(f"Sharded Training on {n_devices} device(s)", file=fout)
@@ -519,6 +599,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
         avg_n_neighbors=25.0,
         atom_energies=config["atom_energies"],
         l_train=True,
+        use_checkpoint=config.get('use_checkpoint', False),
         rngs=model_rngs  # Dedicated rngs for model init
     )
 
@@ -620,10 +701,16 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
 
             pbar_batches = tqdm(loader, desc="  Batches", leave=False,
                                total=len(loader) if hasattr(loader, '__len__') else None)
-            for batch, valid_device_count in pbar_batches:
+            for batch_idx, (batch, batch_info) in enumerate(pbar_batches):
                 # Training step (sharded across all GPUs)
                 params, opt_state, ema_params, step, metrics = train_step(
                     graphdef, params, opt_state, schedule_state, ema_params, step, batch
+                )
+
+                batch_logger.log_batch(
+                    epoch=epoch + 1, mode='train',
+                    file_name=Path(train_pkl).name, batch_idx=batch_idx,
+                    batch_info=batch_info,
                 )
 
                 # Accumulate (metrics are already averaged across devices via pmean)
@@ -747,6 +834,7 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
         print("\nFinal checkpoint saved", file=fout)
 
     print("\nTraining completed!", file=fout)
+    batch_logger.close()
     fout.close()
 
 

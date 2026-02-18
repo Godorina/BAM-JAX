@@ -1,5 +1,5 @@
 {
-    "foundation_ckpt": "/path/to/foundation/ckpt_best.pkl",
+    "foundation_ckpt": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam_omat24-260214-2/ckpt_best.pkl",
 
     "lmax": 3,
     "hidden_irreps": "640x0e + 320x1o + 128x2e + 128x3o",
@@ -33,20 +33,20 @@
 
     "heads": [
         {
-            "name": "replay",
+            "name": "replay_omat24",
             "head_idx": 0,
-            "train_path": "/path/to/replay/train_pkl",
-            "valid_path": "/path/to/replay/val_pkl",
+            "train_path": "data/omat24_train_pkl",
+            "valid_path": "data/omat24_valid_pkl",
             "grad_weight": 0.3,
             "energy_weight": 1.0,
             "force_weight": 1.0,
             "stress_weight": 1.0
         },
         {
-            "name": "target",
+            "name": "target_lpsc",
             "head_idx": 1,
-            "train_path": "/path/to/target/train_pkl",
-            "valid_path": "/path/to/target/val_pkl",
+            "train_path": "data/lpsc_train_pkl",
+            "valid_path": "data/lpsc_valid_pkl",
             "grad_weight": 1.0,
             "energy_weight": 1.0,
             "force_weight": 100.0,

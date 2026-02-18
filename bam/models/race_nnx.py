@@ -240,6 +240,7 @@ class RACE(nnx.Module):
         atom_energies: Optional[Sequence[float]] = None,
         l_train: bool = True,
         periodic: bool = True,
+        use_checkpoint: bool = False,
         *,
         rngs: nnx.Rngs,
     ):
@@ -247,6 +248,7 @@ class RACE(nnx.Module):
         self.lmax = lmax
         self.cutoff = cutoff
         self.periodic = periodic
+        self.use_checkpoint = use_checkpoint
         self.n_species = n_species
         self.radial_basis_size = radial_basis_size
         self.radial_polynomial_p = radial_polynomial_p
@@ -415,22 +417,21 @@ class RACE(nnx.Module):
             self.layers,
             self.x_readouts,
             self.f_readouts):
-            f_energy = f_readout(
-                data.nodes["species"],
-                features
-            )
-            node_energies, features = layer(
-                features,
-                x_feats,
-                data.nodes["species"],
-                sh,
-                radial_basis,
-                data.senders,
-                data.receivers,
-            )
-            x_energy = x_readout(
-                data.nodes["species"],
-                x_feats)
+
+            def _layer_fn(features,
+                          _l=layer, _xr=x_readout, _fr=f_readout):
+                _f_energy = _fr(data.nodes["species"], features)
+                _ne, _feat = _l(
+                    features, x_feats, data.nodes["species"],
+                    sh, radial_basis, data.senders, data.receivers,
+                )
+                _xe = _xr(data.nodes["species"], x_feats)
+                return _ne, _feat, _f_energy, _xe
+
+            if self.use_checkpoint:
+                _layer_fn = jax.checkpoint(_layer_fn)
+
+            node_energies, features, f_energy, x_energy = _layer_fn(features)
             outputs += [node_energies.array[:,0]
                         + x_energy.array[:, 0]
                         + f_energy.array[:, 0]]
@@ -541,57 +542,3 @@ class RACE(nnx.Module):
 
         return graph_energies[:, 0], -grad, stress
 
-
-
-if __name__ == "__main__":
-    # Example usage
-    import numpy as np
-    import pickle
-    from bam.data.atom_energies import ATOM_ENERGIES
-    #from ase.io import read
-
-    print("=" * 70)
-    print("RACE-Style Equivariant Potential")
-    print("=" * 70)
-
-    #data = graphset[0]
-    with open('omat24_val_0.pkl', 'rb') as f:
-        graphset = pickle.load (f)
-    data = graphset[0]
-
-    # Create model
-    rngs = nnx.Rngs(42)
-    model = RACE(
-        n_species=len(ATOM_ENERGIES),
-        lmax=3,
-        hidden_irreps="64x0e + 64x1o + 64x2e",
-        n_layers=3,
-        radial_basis_size=8,
-        radial_mlp_size=64,
-        radial_mlp_layers=3,
-        mlp_init_scale=4.0,
-        shift = 0.0,
-        scale = 1.0,
-        avg_n_neighbors=25,
-        atom_energies=ATOM_ENERGIES,
-        l_train=True,
-        periodic=True,
-        rngs=rngs,
-    )
-
-
-    # Count parameters
-    graphdef, state = nnx.split(model)
-    n_params = sum(x.size for x in jax.tree_util.tree_leaves(state))
-    print(f"\nNumber of parameters: {n_params:,}")
-
-
-    # Run forward pass
-    energies, forces, stress = model(data)
-    print(f"Energies shape: {energies.shape}")
-    print(f"Forces shape: {forces.shape}")
-    print(f"Total energy: {energies[0]:.6f}")
-    print(f"Force magnitude: {np.linalg.norm(forces, axis=-1).mean():.6f}")
-    print(f"stress", stress)
-    print(f"Target energies", data.globals['energy'])
-    print ('target stress', data.globals['stress'], 'eV/A^3')

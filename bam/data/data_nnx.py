@@ -109,7 +109,10 @@ def atoms_to_graph_with_targets(
     forces = np.array(atoms.get_forces(), dtype=np.float32, copy=True)
     cell = np.array(atoms.get_cell().array, dtype=np.float32)[np.newaxis]  # (1, 3, 3)
     volume = np.array([atoms.get_volume()], dtype=np.float32)
-    stress = np.array(atoms.get_stress(), dtype=np.float32, copy=True)[np.newaxis]  # (1, 6)
+    try:
+        stress = np.array(atoms.get_stress(), dtype=np.float32, copy=True)[np.newaxis]  # (1, 6)
+    except Exception:
+        stress = np.zeros((1, 6), dtype=np.float32)
 
     return jraph.GraphsTuple(
         n_node=np.array([len(atoms)], dtype=np.int32),

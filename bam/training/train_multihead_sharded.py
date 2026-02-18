@@ -1,14 +1,19 @@
-"""Multihead RACE multi-GPU training with true data sharding.
+"""Multihead RACE multi-GPU training with gradient accumulation.
 
 Fine-tunes a pre-trained RACE model with multiple heads for different datasets.
 Each head corresponds to a dataset (e.g., OMat24 target + MPTrj replay).
-Data from all heads is interleaved during training. Validation is per-head.
 
-Based on train_sharded.py with multihead extensions.
+Every optimizer step draws one batch from each head, computes per-head gradients
+with per-head E/F/S weights, accumulates them with configurable grad_weight,
+and applies a single optimizer update. This prevents gradient oscillation
+and catastrophic forgetting compared to file-level interleaving.
+
+Validation is per-head. Based on train_sharded.py with multihead extensions.
 """
 
-from typing import Callable, Dict, Tuple, List, Any
+from typing import Callable, Dict, Tuple, List, Any, Optional
 from functools import partial
+import os
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
@@ -24,6 +29,7 @@ import time
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+from datetime import datetime
 
 from bam.data.data_nnx import BucketedDataLoader, MultiDeviceDataLoader
 from bam.data.data_multihead_nnx import DatasetWithHead
@@ -37,6 +43,107 @@ from bam.training.sharding import (
 
 jax.config.update("jax_enable_x64", False)
 
+
+# =============================================================================
+# Batch Logging Utilities
+# =============================================================================
+
+class BatchLogger:
+    """Logger for tracking batch sizes per GPU."""
+
+    def __init__(self, n_devices: int, log_root: str = "batch_logs"):
+        self.n_devices = n_devices
+        self.log_root = Path(log_root)
+        self.cumulative_graphs = {i: 0 for i in range(n_devices)}
+        self.global_base_offset = {i: 0 for i in range(n_devices)}
+
+        self.gpu_logs = {}
+        self.batch_logs = {}
+
+        for gpu_id in range(n_devices):
+            log_dir = self.log_root / f"rank_{gpu_id}"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            gpu_log_path = log_dir / f"gpu{gpu_id}.log"
+            self.gpu_logs[gpu_id] = open(gpu_log_path, 'w')
+
+            batch_log_path = log_dir / "batch_sizes.log"
+            self.batch_logs[gpu_id] = open(batch_log_path, 'w')
+            self.batch_logs[gpu_id].write(
+                f"# Batch size log for GPU {gpu_id}\n"
+            )
+            self.batch_logs[gpu_id].write(
+                "# timestamp,epoch,mode,head,file,batch_idx,n_graphs,n_nodes,n_edges\n"
+            )
+            self.batch_logs[gpu_id].flush()
+
+            self._log_gpu_single(gpu_id, f"Initialized - GPU: {gpu_id}")
+
+        print(f"Created batch logs for {n_devices} GPUs in {log_root}/")
+
+    def _log_gpu_single(self, gpu_id: int, message: str):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.gpu_logs[gpu_id].write(f"[{timestamp}] {message}\n")
+        self.gpu_logs[gpu_id].flush()
+
+    def log_gpu(self, message: str):
+        for gpu_id in range(self.n_devices):
+            self._log_gpu_single(gpu_id, message)
+
+    def log_batch(self, epoch: int, mode: str, head_name: str, file_name: str,
+                  batch_idx: int,
+                  per_device_metadata: List[Tuple[int, int, int]]):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for gpu_id in range(self.n_devices):
+            if gpu_id < len(per_device_metadata):
+                n_graphs, n_nodes, n_edges = per_device_metadata[gpu_id]
+            else:
+                n_graphs, n_nodes, n_edges = 0, 0, 0
+
+            line = (f"{timestamp},{epoch},{mode},{head_name},{file_name},{batch_idx},"
+                    f"{n_graphs},{n_nodes},{n_edges}\n")
+            self.batch_logs[gpu_id].write(line)
+            self.batch_logs[gpu_id].flush()
+
+    def reset_counters(self):
+        for i in range(self.n_devices):
+            self.cumulative_graphs[i] = 0
+
+    def set_total_graphs(self, total_graphs: int):
+        graphs_per_gpu = total_graphs // self.n_devices
+        for gpu_id in range(self.n_devices):
+            self.global_base_offset[gpu_id] = gpu_id * graphs_per_gpu
+
+    def close(self):
+        for gpu_id in range(self.n_devices):
+            if gpu_id in self.gpu_logs and not self.gpu_logs[gpu_id].closed:
+                self.gpu_logs[gpu_id].close()
+            if gpu_id in self.batch_logs and not self.batch_logs[gpu_id].closed:
+                self.batch_logs[gpu_id].close()
+        print("Closed all batch log files")
+
+
+def extract_per_device_batch_metadata(
+    batch, n_devices: int
+) -> List[Tuple[int, int, int]]:
+    """Extract per-device (n_graphs, n_nodes, n_edges) from a stacked batch."""
+    per_device_metadata = []
+
+    n_node_array = np.asarray(batch.n_node)
+    n_edge_array = np.asarray(batch.n_edge)
+
+    for i in range(n_devices):
+        device_n_node = n_node_array[i]
+        device_n_edge = n_edge_array[i]
+
+        n_graphs = int(device_n_node.shape[0]) - 1  # Exclude padding graph
+        n_nodes = int(np.sum(device_n_node[:-1]))
+        n_edges = int(np.sum(device_n_edge[:-1]))
+
+        per_device_metadata.append((n_graphs, n_nodes, n_edges))
+
+    return per_device_metadata
 
 
 def compute_loss_multihead(
@@ -139,44 +246,77 @@ def compute_loss_multihead(
 
 
 # =============================================================================
-# Sharded Training Step
+# Fused Multihead Train Step (gradient accumulation + optimizer in one XLA graph)
 # =============================================================================
 
-def make_sharded_train_step(
-    optimizer: optax.GradientTransformation,
-    mesh: Mesh,
-    energy_weight: float = 1.0,
-    force_weight: float = 1.0,
-    stress_weight: float = 1.0,
-    loss_fn: Callable = None,
-    ema_decay: float = 0.99,
-    num_heads: int = 2,
+def make_fused_multihead_train_step(
+    optimizer, mesh, loss_fn, num_heads, num_head_configs, ema_decay=0.99,
 ):
-    """Create sharded training step for multihead model."""
+    """Fused gradient accumulation + optimizer inside one shard_map.
 
-    def per_device_step(
-        graphdef, params, opt_state, schedule_state, ema_params, step, batch
-    ):
-        batch = squeeze_batch(batch)
+    Takes one batch per head, computes per-head gradients with per-head E/F/S
+    weights, accumulates with grad_weight, and applies a single optimizer step.
+    All within one XLA computation so XLA can pipeline gradient computation
+    with optimizer updates and reuse activation memory across heads.
 
-        def loss_fn_inner(params):
-            return compute_loss_multihead(
-                graphdef, params, batch,
-                energy_weight, force_weight, stress_weight,
-                loss_fn, num_heads,
-            )
+    Args:
+        num_heads: Number of heads in the model (for one_hot in loss).
+        num_head_configs: Number of head configs (= number of batches per step).
+    """
+    N_ARGS_PER_HEAD = 5  # batch, energy_w, force_w, stress_w, grad_w
 
-        (loss, aux), grads = jax.value_and_grad(loss_fn_inner, has_aux=True)(params)
+    def per_device_step(graphdef, params, opt_state, schedule_state,
+                        ema_params, step, *head_args):
+        acc_grads = None
+        total_gw = jnp.float32(0.0)
+        per_head_losses = []
+        per_head_e_losses = []
+        per_head_f_losses = []
+        per_head_s_losses = []
+        per_head_grad_norms = []
+        per_head_n_graphs = []
+        per_head_n_atoms = []
 
-        # Synchronize across devices
-        grads = jax.lax.pmean(grads, axis_name='dp')
-        loss = jax.lax.pmean(loss, axis_name='dp')
-        aux = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name='dp'), aux)
+        for i in range(num_head_configs):
+            base = i * N_ARGS_PER_HEAD
+            batch_i = squeeze_batch(head_args[base])
+            e_w = head_args[base + 1]
+            f_w = head_args[base + 2]
+            s_w = head_args[base + 3]
+            g_w = head_args[base + 4]
 
-        grad_norm = optax.global_norm(grads)
+            def loss_fn_i(params, _b=batch_i, _ew=e_w, _fw=f_w, _sw=s_w):
+                return compute_loss_multihead(
+                    graphdef, params, _b, _ew, _fw, _sw, loss_fn, num_heads,
+                )
 
-        # Apply update
-        updates, new_opt = optimizer.update(grads, opt_state, params)
+            (loss_i, aux_i), grads_i = jax.value_and_grad(
+                loss_fn_i, has_aux=True,
+            )(params)
+
+            # Weighted gradient accumulation
+            weighted = jax.tree.map(lambda g: g * g_w, grads_i)
+            if acc_grads is None:
+                acc_grads = weighted
+            else:
+                acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, weighted)
+            total_gw = total_gw + g_w
+
+            per_head_losses.append(loss_i)
+            per_head_e_losses.append(aux_i['energy_loss'])
+            per_head_f_losses.append(aux_i['force_loss'])
+            per_head_s_losses.append(aux_i['stress_loss'])
+            per_head_grad_norms.append(optax.global_norm(grads_i))
+            per_head_n_graphs.append(aux_i['n_graphs'])
+            per_head_n_atoms.append(aux_i['n_atoms'])
+
+        # Normalize and sync across devices
+        acc_grads = jax.tree.map(lambda g: g / total_gw, acc_grads)
+        acc_grads = jax.lax.pmean(acc_grads, axis_name='dp')
+        combined_grad_norm = optax.global_norm(acc_grads)
+
+        # Optimizer step
+        updates, new_opt = optimizer.update(acc_grads, opt_state, params)
         updates = optax.tree_utils.tree_scale(schedule_state.scale, updates)
         new_p = optax.apply_updates(params, updates)
         new_ema = jax.tree.map(
@@ -184,36 +324,42 @@ def make_sharded_train_step(
             ema_params, new_p,
         )
 
+        # Per-head metrics (stacked arrays, shape=(num_head_configs,))
         metrics = {
-            'loss': loss,
-            'grad_norm': grad_norm,
-            **aux,
+            'combined_grad_norm': combined_grad_norm,
+            'per_head_loss': jax.lax.pmean(
+                jnp.stack(per_head_losses), axis_name='dp'),
+            'per_head_energy_loss': jax.lax.pmean(
+                jnp.stack(per_head_e_losses), axis_name='dp'),
+            'per_head_force_loss': jax.lax.pmean(
+                jnp.stack(per_head_f_losses), axis_name='dp'),
+            'per_head_stress_loss': jax.lax.pmean(
+                jnp.stack(per_head_s_losses), axis_name='dp'),
+            'per_head_grad_norm': jax.lax.pmean(
+                jnp.stack(per_head_grad_norms), axis_name='dp'),
+            'per_head_n_graphs': jax.lax.pmean(
+                jnp.stack(per_head_n_graphs), axis_name='dp'),
+            'per_head_n_atoms': jax.lax.pmean(
+                jnp.stack(per_head_n_atoms), axis_name='dp'),
         }
 
         return new_p, new_opt, new_ema, step + 1, metrics
 
-    sharded_step = shard_map(
-        per_device_step,
-        mesh=mesh,
-        in_specs=(
-            P(),       # graphdef
-            P(),       # params
-            P(),       # opt_state
-            P(),       # schedule_state
-            P(),       # ema_params
-            P(),       # step
-            P('dp'),   # batch
-        ),
-        out_specs=(
-            P(),       # new_params
-            P(),       # new_opt_state
-            P(),       # new_ema_params
-            P(),       # step
-            P(),       # metrics
-        ),
+    # Build in_specs dynamically
+    fixed_specs = (P(), P(), P(), P(), P(), P())  # graphdef,params,opt,sched,ema,step
+    head_specs = tuple(
+        spec
+        for _ in range(num_head_configs)
+        for spec in (P('dp'), P(), P(), P(), P())  # batch, e_w, f_w, s_w, g_w
     )
 
-    return jax.jit(sharded_step)
+    sharded_fn = shard_map(
+        per_device_step,
+        mesh=mesh,
+        in_specs=fixed_specs + head_specs,
+        out_specs=(P(), P(), P(), P(), P()),
+    )
+    return jax.jit(sharded_fn)
 
 
 # =============================================================================
@@ -277,6 +423,8 @@ def evaluate_per_head(
     stress_weight: float,
     loss_fn: Callable,
     num_heads: int,
+    batch_logger: Optional[BatchLogger] = None,
+    epoch: int = 0,
 ) -> Tuple[Dict, float]:
     """Evaluate model on each head's validation set separately.
 
@@ -310,7 +458,16 @@ def evaluate_per_head(
         }
 
         for fname in tqdm(valid_files, desc=f"  Eval {head_name}", leave=False):
+            file_name = Path(fname).name
+
+            if batch_logger is not None:
+                batch_logger.reset_counters()
+
             dataset = DatasetWithHead(file_path=fname, head_idx=head_idx)
+
+            if batch_logger is not None:
+                batch_logger.set_total_graphs(len(dataset))
+
             base_loader = BucketedDataLoader(
                 dataset=dataset,
                 batch_size=batch_size,
@@ -326,10 +483,25 @@ def evaluate_per_head(
                 drop_incomplete=False,
             )
 
+            batch_idx = 0
             for batch, info in loader:
+                batch_idx += 1
                 metrics = eval_step(graphdef, params_replicated, batch)
                 for k in totals:
                     totals[k] += float(metrics[k])
+
+                if batch_logger is not None:
+                    per_device_metadata = extract_per_device_batch_metadata(
+                        batch, n_devices
+                    )
+                    batch_logger.log_batch(
+                        epoch=epoch,
+                        mode='valid',
+                        head_name=head_name,
+                        file_name=file_name,
+                        batch_idx=batch_idx,
+                        per_device_metadata=per_device_metadata,
+                    )
 
         n_g = max(totals['n_graphs'], 1)
         n_a = max(totals['n_atoms'], 1)
@@ -365,6 +537,24 @@ def evaluate_per_head(
 # Utilities
 # =============================================================================
 
+def parse_head_weights(
+    head_configs: List[Dict],
+    global_e_w: float,
+    global_f_w: float,
+    global_s_w: float,
+) -> Dict[int, Dict[str, jnp.ndarray]]:
+    """Parse per-head E/F/S/grad weights. Falls back to global values if absent."""
+    weights = {}
+    for hc in head_configs:
+        weights[hc["head_idx"]] = {
+            'energy_weight': jnp.array(hc.get('energy_weight', global_e_w), dtype=jnp.float32),
+            'force_weight': jnp.array(hc.get('force_weight', global_f_w), dtype=jnp.float32),
+            'stress_weight': jnp.array(hc.get('stress_weight', global_s_w), dtype=jnp.float32),
+            'grad_weight': jnp.array(hc.get('grad_weight', 1.0), dtype=jnp.float32),
+        }
+    return weights
+
+
 def _get_pkl_files(path: str) -> List[str]:
     """Get sorted list of pkl files from a directory path."""
     import re
@@ -379,38 +569,86 @@ def _get_pkl_files(path: str) -> List[str]:
     return [str(f) for f in files]
 
 
-def _interleave_file_lists(
-    head_configs: List[Dict],
-    epoch: int,
-    seed: int,
-) -> List[Tuple[str, int]]:
-    """Build interleaved list of (pkl_file, head_idx) for an epoch.
+class HeadBatchStream:
+    """Per-head batch stream with automatic file transitions and cycling.
 
-    Shuffles files within each head, then round-robin interleaves heads.
-
-    Returns:
-        List of (file_path, head_idx) tuples.
+    Shuffles file list, creates DataLoaders one file at a time, and yields
+    batches. When all files are exhausted, reshuffles and cycles.
     """
-    rng = np.random.RandomState(seed + epoch)
 
-    per_head_files = []
-    for head_cfg in head_configs:
-        train_path = head_cfg["train_path"]
-        files = _get_pkl_files(train_path)
-        rng.shuffle(files)
-        per_head_files.append(
-            [(f, head_cfg["head_idx"]) for f in files]
+    def __init__(self, head_config, seed, epoch, batch_size, n_devices, mesh,
+                 max_nodes_per_batch=256):
+        self.head_idx = head_config["head_idx"]
+        self.head_name = head_config["name"]
+        self.all_files = _get_pkl_files(head_config["train_path"])
+        self.n_files = len(self.all_files)
+        self.seed = seed
+        self.epoch = epoch
+        self.batch_size = batch_size
+        self.n_devices = n_devices
+        self.mesh = mesh
+        self.max_nodes_per_batch = max_nodes_per_batch
+
+        self.cycle_count = 0
+        self.file_idx = 0
+        self.files_consumed = 0
+        self.batches_yielded = 0
+        self._current_iter = None
+        self._current_file = None
+
+        self._shuffle_files()
+
+    def _shuffle_files(self):
+        rng = np.random.RandomState(
+            self.seed + 1000 * self.epoch + 100 * self.head_idx + self.cycle_count
         )
+        self.shuffled_files = list(self.all_files)
+        rng.shuffle(self.shuffled_files)
+        self.file_idx = 0
 
-    # Round-robin interleave
-    result = []
-    max_len = max(len(fl) for fl in per_head_files)
-    for i in range(max_len):
-        for fl in per_head_files:
-            if i < len(fl):
-                result.append(fl[i])
+    def _open_next_file(self):
+        """Create DataLoader for the next file. Cycles if exhausted."""
+        if self.file_idx >= self.n_files:
+            self.cycle_count += 1
+            self._shuffle_files()
 
-    return result
+        file_path = self.shuffled_files[self.file_idx]
+        self.file_idx += 1
+        self.files_consumed += 1
+
+        dataset = DatasetWithHead(file_path=file_path, head_idx=self.head_idx)
+        rngs = nnx.Rngs(
+            self.seed + 100 * self.epoch + 10 * self.files_consumed + self.head_idx
+        )
+        base_loader = BucketedDataLoader(
+            dataset=dataset, batch_size=self.batch_size,
+            n_buckets=8, shuffle=True, drop_last=True,
+            rngs=rngs, max_nodes_per_batch=self.max_nodes_per_batch,
+        )
+        loader = MultiDeviceDataLoader(
+            base_loader=base_loader, n_devices=self.n_devices,
+            mesh=self.mesh, drop_incomplete=True,
+        )
+        self._current_iter = iter(loader)
+        self._current_file = file_path
+
+    def next_batch(self):
+        """Return next batch, automatically transitioning files and cycling."""
+        while True:
+            if self._current_iter is not None:
+                try:
+                    batch, info = next(self._current_iter)
+                    self.batches_yielded += 1
+                    return batch, info
+                except StopIteration:
+                    self._current_iter = None
+            self._open_next_file()
+
+    @property
+    def completed_first_pass(self):
+        """Whether the first full pass through all files is complete."""
+        return self.files_consumed >= self.n_files
+
 
 
 # =============================================================================
@@ -423,6 +661,12 @@ def train_multihead_sharded(config: Dict):
     mesh, n_devices = setup_mesh()
     fout = open(config.get('fname_log', 'loss_multihead.out'), 'w', 1)
 
+    # Initialize batch logger
+    batch_logger = BatchLogger(
+        n_devices=n_devices,
+        log_root=config.get('batch_log_root', 'batch_logs'),
+    )
+
     head_configs = config["heads"]
     num_heads = len(head_configs)
 
@@ -434,6 +678,9 @@ def train_multihead_sharded(config: Dict):
     print(f"Effective batch size: {config['batch_size']} x {n_devices} = "
           f"{config['batch_size'] * n_devices}", file=fout)
     print("=" * 70, file=fout)
+
+    batch_logger.log_gpu(f"Multihead training started on {n_devices} device(s)")
+    batch_logger.log_gpu(f"Heads: {[hc['name'] for hc in head_configs]}")
 
     seed = config.get('seed', 42)
     model_rngs = nnx.Rngs(seed)
@@ -503,16 +750,21 @@ def train_multihead_sharded(config: Dict):
     huber_delta = config.get('huber_delta', 0.02)
     loss_fn = partial(LOSS_FUNCTIONS[loss_type], delta=huber_delta)
 
-    train_step = make_sharded_train_step(
+    # Per-head weights (JAX arrays, will be replicated after checkpoint load)
+    head_weights = parse_head_weights(head_configs, energy_weight, force_weight, stress_weight)
+
+    # Fused multihead train step: grad accumulation + optimizer in one XLA graph
+    train_step = make_fused_multihead_train_step(
         optimizer=optimizer,
         mesh=mesh,
-        energy_weight=energy_weight,
-        force_weight=force_weight,
-        stress_weight=stress_weight,
         loss_fn=loss_fn,
-        ema_decay=config.get('ema_decay', 0.99),
         num_heads=num_heads,
+        num_head_configs=len(head_configs),
+        ema_decay=config.get('ema_decay', 0.99),
     )
+
+    log_every = config.get('log_every', 50)
+    max_nodes_per_batch = config.get('max_nodes_per_batch', 256)
 
     # Load checkpoint if restarting
     best_val_loss = float('inf')
@@ -526,123 +778,98 @@ def train_multihead_sharded(config: Dict):
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
         print(f"Resumed from step {ckpt.get('step', 0)}", file=fout)
 
+    # Replicate per-head weights across devices
+    for h in head_weights:
+        head_weights[h] = {k: replicate(v, mesh) for k, v in head_weights[h].items()}
+
     # Training loop
     best_state = None
 
     for epoch in range(config["n_epochs"]):
         epoch_start = time.time()
 
-        # Interleave files from all heads
-        file_list = _interleave_file_lists(head_configs, epoch, seed)
+        # Per-head batch streams
+        streams = {
+            hc["head_idx"]: HeadBatchStream(
+                hc, seed, epoch, config['batch_size'], n_devices, mesh,
+                max_nodes_per_batch=max_nodes_per_batch,
+            )
+            for hc in head_configs
+        }
+        longest_head = max(streams.keys(), key=lambda h: streams[h].n_files)
 
-        pbar_files = tqdm(
-            enumerate(file_list),
-            total=len(file_list),
-            desc=f"Epoch {epoch+1} files",
-            leave=False,
-        )
+        step_in_epoch = 0
+        epoch_step_start = time.time()
 
-        for ipkl, (train_pkl, head_idx) in pbar_files:
-            head_name = head_configs[head_idx]["name"]
-            pbar_files.set_postfix({"file": Path(train_pkl).name, "head": head_name})
+        while not streams[longest_head].completed_first_pass:
+            step_in_epoch += 1
 
-            train_dataset = DatasetWithHead(
-                file_path=train_pkl, head_idx=head_idx
+            # === Collect one batch from each head ===
+            head_batches = []
+            head_batch_meta = []  # for logging
+            for head_cfg in head_configs:
+                h = head_cfg["head_idx"]
+                stream = streams[h]
+                batch, info = stream.next_batch()
+                head_batches.append(batch)
+                head_batch_meta.append((head_cfg, stream, batch))
+
+            # === Build fused step arguments ===
+            # Layout: (batch_0, e_w_0, f_w_0, s_w_0, g_w_0, batch_1, ...)
+            head_args = []
+            for i, head_cfg in enumerate(head_configs):
+                hw = head_weights[head_cfg["head_idx"]]
+                head_args.extend([
+                    head_batches[i],
+                    hw['energy_weight'], hw['force_weight'],
+                    hw['stress_weight'], hw['grad_weight'],
+                ])
+
+            # === Fused train step: grad accumulation + optimizer in one XLA call ===
+            params, opt_state, ema_params, step, metrics = train_step(
+                graphdef, params, opt_state, schedule_state,
+                ema_params, step, *head_args,
             )
 
-            loader_rngs = nnx.Rngs(seed + 100 * epoch + ipkl)
-            base_loader = BucketedDataLoader(
-                dataset=train_dataset,
-                batch_size=config['batch_size'],
-                n_buckets=8,
-                shuffle=True,
-                drop_last=True,
-                rngs=loader_rngs,
-            )
-            loader = MultiDeviceDataLoader(
-                base_loader=base_loader,
-                n_devices=n_devices,
-                mesh=mesh,
-                drop_incomplete=True,
-            )
-
-            acc_energy_loss, acc_force_loss, acc_stress_loss = 0., 0., 0.
-            acc_graphs, acc_atoms, acc_grad = 0., 0., 0.
-            dataset_start = time.time()
             current_step = int(np.asarray(step))
 
-            pbar_batches = tqdm(
-                loader,
-                desc="  Batches",
-                leave=False,
-                total=len(loader) if hasattr(loader, '__len__') else None,
-            )
-
-            for batch, valid_device_count in pbar_batches:
-                params, opt_state, ema_params, step, metrics = train_step(
-                    graphdef, params, opt_state, schedule_state,
-                    ema_params, step, batch,
+            # === Batch logging ===
+            for head_cfg, stream, batch in head_batch_meta:
+                per_device_metadata = extract_per_device_batch_metadata(batch, n_devices)
+                batch_logger.log_batch(
+                    epoch, 'train', head_cfg["name"],
+                    Path(stream._current_file).name, stream.batches_yielded,
+                    per_device_metadata,
                 )
 
-                n_g = float(metrics['n_graphs'])
-                n_a = float(metrics['n_atoms'])
-                acc_energy_loss += float(metrics['energy_loss']) * n_g
-                acc_force_loss += float(metrics['force_loss']) * 3 * n_a
-                acc_stress_loss += float(metrics['stress_loss']) * n_g
-                acc_graphs += n_g
-                acc_atoms += n_a
-                acc_grad += float(metrics['grad_norm']) * n_g
-
-                current_step = int(np.asarray(step))
-
-                if acc_graphs > 0:
-                    pbar_batches.set_postfix({
-                        "loss": f"{(energy_weight*acc_energy_loss/acc_graphs + force_weight*acc_force_loss/(3*acc_atoms) + stress_weight*acc_stress_loss/acc_graphs):.4f}",
-                        "step": current_step,
-                    })
-
-                if current_step % 50 == 0:
-                    e_loss = acc_energy_loss / max(acc_graphs, 1)
-                    f_loss = acc_force_loss / max(3 * acc_atoms, 1)
-                    s_loss = acc_stress_loss / max(acc_graphs, 1)
-                    total_loss = (
-                        energy_weight * e_loss
-                        + force_weight * f_loss
-                        + stress_weight * s_loss
-                    )
+            # === Logging ===
+            if current_step % log_every == 0:
+                elapsed = time.time() - epoch_step_start
+                unrep_schedule = unreplicate_pytree(schedule_state)
+                lr = config['learning_rate'] * float(unrep_schedule.scale)
+                print(f"step {current_step} (epoch {epoch+1}, {elapsed:.1f}s, LR={lr:.2e})",
+                      file=fout)
+                for i, head_cfg in enumerate(head_configs):
+                    stream = streams[head_cfg["head_idx"]]
+                    cycle_str = f" cyc={stream.cycle_count}" if stream.cycle_count > 0 else ""
                     print(
-                        f"step {current_step} [{head_name}] LOSS: {total_loss:.6f} "
-                        f"E_LOSS: {e_loss:.6f} F_LOSS: {f_loss:.6f}",
+                        f"  [{head_cfg['name']}{cycle_str}] "
+                        f"loss={float(metrics['per_head_loss'][i]):.6f} "
+                        f"E={float(metrics['per_head_energy_loss'][i]):.6f} "
+                        f"F={float(metrics['per_head_force_loss'][i]):.6f} "
+                        f"S={float(metrics['per_head_stress_loss'][i]):.6f} "
+                        f"grad={float(metrics['per_head_grad_norm'][i]):.4f}",
                         file=fout,
                     )
+                print(f"  [combined] grad_norm={float(metrics['combined_grad_norm']):.4f}",
+                      file=fout)
 
-            unrep_schedule = unreplicate_pytree(schedule_state)
-            lr = config['learning_rate'] * float(unrep_schedule.scale)
-            dataset_time = time.time() - dataset_start
-
-            e_loss = acc_energy_loss / max(acc_graphs, 1)
-            f_loss = acc_force_loss / max(3 * acc_atoms, 1)
-            s_loss = acc_stress_loss / max(acc_graphs, 1)
-            total_loss = (
-                energy_weight * e_loss
-                + force_weight * f_loss
-                + stress_weight * s_loss
-            )
-
-            print(
-                f"Epoch {epoch+1}/{config['n_epochs']} IPKL {ipkl+1} "
-                f"[{head_name}] ({dataset_time:.1f}s) "
-                f"Step {current_step} LR: {lr:.2e}",
-                file=fout,
-            )
-            print(
-                f"  Train | Loss: {total_loss:.6f} | "
-                f"E_LOSS: {e_loss:.6f} | "
-                f"F_LOSS: {f_loss:.6f} | "
-                f"S_LOSS: {s_loss:.6f} | "
-                f"Grad: {acc_grad/max(acc_graphs,1):.4f}",
-                file=fout,
-            )
+        # Log stream statistics
+        for h, stream in streams.items():
+            hname = next(hc["name"] for hc in head_configs if hc["head_idx"] == h)
+            print(f"  [{hname}] files={stream.files_consumed}/{stream.n_files} "
+                  f"cycles={stream.cycle_count} batches={stream.batches_yielded}",
+                  file=fout)
 
         # End-of-epoch validation (per-head)
         val_start = time.time()
@@ -660,6 +887,8 @@ def train_multihead_sharded(config: Dict):
             stress_weight=stress_weight,
             loss_fn=loss_fn,
             num_heads=num_heads,
+            batch_logger=batch_logger,
+            epoch=epoch,
         )
         val_time = time.time() - val_start
 
@@ -726,6 +955,11 @@ def train_multihead_sharded(config: Dict):
         print("\nFinal checkpoint saved", file=fout)
 
     print("\nMultihead training completed!", file=fout)
+
+    # Close batch logger
+    batch_logger.log_gpu("Training completed")
+    batch_logger.close()
+
     fout.close()
 
 

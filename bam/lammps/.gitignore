@@ -1,0 +1,10 @@
+# Build-time cloned repositories (Step 0)
+chemtrain/
+lammps/
+
+# chemtrain-deploy (if cloned directly without chemtrain parent)
+chemtrain-deploy/
+
+# Python
+__pycache__/
+*.pyc

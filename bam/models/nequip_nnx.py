@@ -294,6 +294,7 @@ class Nequip(nnx.Module):
         atom_energies: Optional[Sequence[float]] = None,
         l_train: bool = True,
         periodic: bool = True,
+        use_checkpoint: bool = False,
         *,
         rngs: nnx.Rngs,
     ):
@@ -301,6 +302,7 @@ class Nequip(nnx.Module):
         self.lmax = lmax
         self.cutoff = cutoff
         self.periodic = periodic
+        self.use_checkpoint = use_checkpoint
         self.n_species = n_species
         self.radial_basis_size = radial_basis_size
         self.radial_polynomial_p = radial_polynomial_p
@@ -436,14 +438,16 @@ class Nequip(nnx.Module):
         )
 
         for layer in self.layers:
-            features = layer(
-                features,
-                data.nodes["species"],
-                sh,
-                radial_basis,
-                data.senders,
-                data.receivers,
-            )
+            def _layer_fn(features, _l=layer):
+                return _l(
+                    features, data.nodes["species"],
+                    sh, radial_basis, data.senders, data.receivers,
+                )
+
+            if self.use_checkpoint:
+                _layer_fn = jax.checkpoint(_layer_fn)
+
+            features = _layer_fn(features)
 
         features = self.readout1(features)
         node_energies = self.readout(features)
@@ -557,83 +561,4 @@ def node_graph_idx(data: jraph.GraphsTuple) -> jnp.ndarray:
         graph_idx, data.n_node, axis=0, total_repeat_length=sum_n_node
     )
     return node_gr_idx
-
-
-
-
-if __name__ == "__main__":
-    # Example usage
-    import numpy as np
-    import pickle
-    #from ase.io import read
-
-    print("=" * 70)
-    print("Nequip-Style Equivariant Potential")
-    print("=" * 70)
-
-    """
-    uniq_element = {z: i for i, z in enumerate([1, 6, 7, 8])}
-    #enr_avg_per_element = {i: -654.09 for i in range(4)}
-    enr_avg_per_element = {
-        1: -13.587222780835477,
-        6: -1029.4889999855063,
-        7: -1484.9814568572233,
-        8: -2041.9816003861047,
-    }
-
-    # Load data
-    atoms = read('dataset_3BPA/train_300K.xyz', index=0)
-    graphset = get_graphset(
-        [atoms],
-        cutoff=5.0,
-        nbatch=1,
-        uniq_element=uniq_element,
-        enr_avg_per_element=enr_avg_per_element
-    )
-    """
-    #data = graphset[0]
-    with open('omat24_val_0.pkl', 'rb') as f:
-        graphset = pickle.load (f)
-    data = graphset[0]
-
-    lines = open('atom_energies.dat', 'r').readlines()
-    atom_energies = []
-    for line in lines:
-        key = line.split()
-        atom_energies.append (float(key[1]))
-
-    # Create model
-    rngs = nnx.Rngs(42)
-    model = Nequip(
-        n_species=len(atom_energies),
-        lmax=3,
-        hidden_size=128,
-        n_layers=3,
-        radial_basis_size=8,
-        radial_mlp_size=64,
-        radial_mlp_layers=3,
-        mlp_init_scale=4.0,
-        shift = 0.0,
-        scale = 1.0,
-        avg_n_neighbors=25,
-        atom_energies=atom_energies,
-        rngs=rngs,
-    )
-
-
-    # Count parameters
-    graphdef, state = nnx.split(model)
-    n_params = sum(x.size for x in jax.tree_util.tree_leaves(state))
-    print(f"\nNumber of parameters: {n_params:,}")
-
-
-    # Run forward pass
-    energies, forces, stress = model(data)
-    print(f"Energies shape: {energies.shape}")
-    print(f"Forces shape: {forces.shape}")
-    print(f"Total energy: {energies[0]:.6f}")
-    print(f"Force magnitude: {np.linalg.norm(forces, axis=-1).mean():.6f}")
-    print(f"stress", stress)
-    print(f"Target energies", data.globals['energy'])
-    print ('target stress', data.globals['stress'], 'eV/A^3')
 

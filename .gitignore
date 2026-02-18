@@ -15,10 +15,16 @@ build/
 data/
 !bam/data/
 
+# LAMMPS outputs & model binaries
+*.lammpstrj
+*.ptb
+*.bin
+
 # Training outputs
 ckpt_*.pkl
 *.out
 *.log
+batch_logs/
 eval_log.txt
 eval_results.json
 

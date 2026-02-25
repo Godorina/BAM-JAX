@@ -1,5 +1,5 @@
 {
-    "foundation_ckpt": "/home/hgpark/BAM-nequip/BAM-nequip-main/bam_omat24-260214-2/ckpt_best.pkl",
+    "foundation_ckpt": "ckpt_foundation.pkl",
 
     "lmax": 3,
     "hidden_irreps": "640x0e + 320x1o + 128x2e + 128x3o",

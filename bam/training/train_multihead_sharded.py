@@ -695,6 +695,7 @@ def train_multihead_sharded(config: Dict):
             num_heads=num_heads,
             config=config,
             rngs=model_rngs,
+            use_checkpoint=config.get('use_checkpoint', False),
         )
     else:
         model = RACEMultihead(
@@ -714,6 +715,7 @@ def train_multihead_sharded(config: Dict):
             atom_energies=config["atom_energies"],
             l_train=True,
             periodic=True,
+            use_checkpoint=config.get('use_checkpoint', False),
             rngs=model_rngs,
         )
         graphdef, params = nnx.split(model, nnx.Param)
@@ -768,6 +770,7 @@ def train_multihead_sharded(config: Dict):
 
     # Load checkpoint if restarting
     best_val_loss = float('inf')
+    start_epoch = 0
     if config.get('restart', False) and Path('ckpt_multihead_best.pkl').exists():
         ckpt = load_checkpoint('ckpt_multihead_best.pkl')
         params = replicate_pytree(ckpt['params'], mesh)
@@ -776,7 +779,8 @@ def train_multihead_sharded(config: Dict):
         schedule_state = replicate_pytree(ckpt['schedule_state'], mesh)
         step = replicate(jnp.array(ckpt.get('step', 0)), mesh)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
-        print(f"Resumed from step {ckpt.get('step', 0)}", file=fout)
+        start_epoch = ckpt.get('epoch', 0) + 1
+        print(f"Resumed from epoch {start_epoch}, step {ckpt.get('step', 0)}", file=fout)
 
     # Replicate per-head weights across devices
     for h in head_weights:
@@ -785,7 +789,7 @@ def train_multihead_sharded(config: Dict):
     # Training loop
     best_state = None
 
-    for epoch in range(config["n_epochs"]):
+    for epoch in range(start_epoch, config["n_epochs"]):
         epoch_start = time.time()
 
         # Per-head batch streams
@@ -923,6 +927,7 @@ def train_multihead_sharded(config: Dict):
                 'opt_state': unreplicate_pytree(opt_state),
                 'schedule_state': new_schedule,
                 'step': int(np.asarray(step)),
+                'epoch': epoch,
                 'best_val_loss': best_val_loss,
                 'metrics': per_head_metrics,
                 'num_heads': num_heads,
@@ -992,7 +997,13 @@ if __name__ == "__main__":
     if atom_energies_path and Path(atom_energies_path).exists():
         print(f"Loading atom energies from {atom_energies_path}")
         with open(atom_energies_path) as f:
-            config['atom_energies'] = json.load(f)
+            ae_data = json.load(f)
+        if isinstance(ae_data, dict):
+            # New format: {"atom_energies": [...], "atomic_numbers": [...], ...}
+            config['atom_energies'] = ae_data['atom_energies']
+        else:
+            # Old format: plain list
+            config['atom_energies'] = ae_data
     else:
         print("Using built-in ATOM_ENERGIES")
         config['atom_energies'] = ATOM_ENERGIES.tolist()

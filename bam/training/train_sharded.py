@@ -130,14 +130,14 @@ def make_sharded_train_step(
         """Training step for a single device's batch."""
         # Squeeze the leading device dimension: (1, ...) -> (...)
         batch = squeeze_batch(batch)
-        def loss_fn(params):
+        def grad_fn(params):
             return compute_loss(
                 graphdef, params, batch,
                 energy_weight, force_weight, stress_weight, loss_fn
             )
 
         # Compute gradients locally
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (loss, aux), grads = jax.value_and_grad(grad_fn, has_aux=True)(params)
 
         # Synchronize gradients and metrics across devices
         grads = jax.lax.pmean(grads, axis_name='dp')
@@ -281,7 +281,8 @@ def evaluate_sharded(
     energy_weight: float = 1.0,
     force_weight: float = 1.0,
     stress_weight: float = 1.0,
-    loss_fn: Callable = None
+    loss_fn: Callable = None,
+    **kwargs,
 ) -> Dict:
     """Evaluate model on validation set using all GPUs.
 
@@ -321,6 +322,7 @@ def evaluate_sharded(
     # Create sharded evaluation function
     eval_step = make_sharded_evaluate_step(mesh, loss_fn=loss_fn)
 
+    max_nodes_per_batch = kwargs.get('max_nodes_per_batch', 256)
     for fname in tqdm(files_pkl, desc="Evaluating files", leave=False):
         dataset = Dataset(file_path=fname)
         base_loader = BucketedDataLoader (
@@ -329,7 +331,8 @@ def evaluate_sharded(
             n_buckets=8,
             shuffle=False,       # No shuffle for deterministic evaluation
             drop_last=False,     # Evaluate ALL data
-            rngs=nnx.Rngs(0)    # Deterministic rngs (not used when shuffle=False)
+            rngs=nnx.Rngs(0),   # Deterministic rngs (not used when shuffle=False)
+            max_nodes_per_batch=max_nodes_per_batch,
         )
         # Use multi-device loader for evaluation
         loader = MultiDeviceDataLoader(
@@ -460,7 +463,8 @@ def predict_sharded(config: Dict):
         energy_weight=model_config.get('energy_weight', 1.0),
         force_weight=model_config.get('force_weight', 1.0),
         stress_weight=model_config.get('stress_weight', 1.0),
-        loss_fn=loss_fn
+        loss_fn=loss_fn,
+        max_nodes_per_batch=model_config.get('max_nodes_per_batch', 256),
     )
 
     # Print results
@@ -684,7 +688,8 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
                 n_buckets=8,
                 shuffle=True,
                 drop_last=True,
-                rngs=loader_rngs  # Deterministic per epoch + file
+                rngs=loader_rngs,  # Deterministic per epoch + file
+                max_nodes_per_batch=config.get('max_nodes_per_batch', 256),
             )
             loader = MultiDeviceDataLoader(
                 base_loader=base_loader,
@@ -778,7 +783,8 @@ def train_sharded(config: Dict, train_files_pkl: List[str], valid_files_pkl: Lis
                 energy_weight=energy_weight,
                 force_weight=force_weight,
                 stress_weight=stress_weight,
-                loss_fn=loss_fn
+                loss_fn=loss_fn,
+                max_nodes_per_batch=config.get('max_nodes_per_batch', 256),
             )
             val_time = time.time() - val_start
 
@@ -889,7 +895,13 @@ if __name__ == "__main__":
     if atom_energies_path and Path(atom_energies_path).exists():
         print(f"Loading atom energies from {atom_energies_path}")
         with open(atom_energies_path) as f:
-            config['atom_energies'] = json.load(f)
+            ae_data = json.load(f)
+        if isinstance(ae_data, dict):
+            # New format: {"atom_energies": [...], "atomic_numbers": [...], ...}
+            config['atom_energies'] = ae_data['atom_energies']
+        else:
+            # Old format: plain list
+            config['atom_energies'] = ae_data
     else:
         print("Using built-in ATOM_ENERGIES")
         config['atom_energies'] = ATOM_ENERGIES.tolist()

@@ -1,0 +1,43 @@
+{
+    "cutoff": 6.0,
+    "train_path": "data/train_pkl",
+    "valid_path": "data/valid_pkl",
+    "atom_energies_path": "atom_energies.json",
+
+    "lmax": 1,
+    "hidden_irreps": "128x0e + 32x1o",
+    "n_layers": 3,
+    "radial_basis_size": 8,
+    "radial_mlp_size": 64,
+    "radial_mlp_layers": 3,
+    "radial_polynomial_p": 5.0,
+    "mlp_init_scale": 4.0,
+
+    "learning_rate": 0.01,
+    "batch_size": 64,
+    "n_epochs": 100,
+    "energy_weight": 1.0,
+    "force_weight": 100.0,
+    "stress_weight": 1.0,
+    "loss_type": "mae",
+    "huber_delta": 0.02,
+    "ema_decay": 0.99,
+    "grad_clip": 1.0,
+    "use_checkpoint": false,
+    "max_nodes_per_batch": 28000,
+
+    "lr_schedule_patience": 25,
+    "lr_schedule_factor": 0.8,
+    "lr_schedule_min_scale": 0.01,
+
+    "log_every": 100,
+    "seed": 42,
+    "restart": false,
+    "fname_log": "loss.out",
+
+    "predict": {
+        "evaluate_tag": false,
+        "model": "ckpt_best.pkl",
+        "test_path": "data/test_pkl"
+    }
+}

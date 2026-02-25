@@ -101,7 +101,7 @@ def load_checkpoint(checkpoint_path: str):
 
 if __name__ == "__main__":
     from ase.io import write
-    lines = open('/home/gpuuser/prog/BAM-nequip-main/input/atom_energies.dat', 'r').readlines()
+    lines = open('atom_energies.dat', 'r').readlines()
     atom_energies = []
     for line in lines:
         key = line.split()
@@ -109,7 +109,7 @@ if __name__ == "__main__":
     atom_energies = np.array(atom_energies)
 
     config_kwargs = {}
-    dir_train = "/dataset/usr004/hgpark/omat24/train/"
+    dir_train = "/path/to/omat24/train/"
     sample_list = [
         "aimd-from-PBE-1000-npt",
         "aimd-from-PBE-1000-nvt",

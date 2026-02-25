@@ -121,12 +121,14 @@ class RACEMultihead(nnx.Module):
         atom_energies: Optional[Sequence[float]] = None,
         l_train: bool = True,
         periodic: bool = True,
+        use_checkpoint: bool = False,
         *,
         rngs: nnx.Rngs,
     ):
         self.lmax = lmax
         self.cutoff = cutoff
         self.periodic = periodic
+        self.use_checkpoint = use_checkpoint
         self.n_species = n_species
         self.radial_basis_size = radial_basis_size
         self.radial_polynomial_p = radial_polynomial_p
@@ -294,17 +296,20 @@ class RACEMultihead(nnx.Module):
         for (layer, x_readout, f_readout) in zip(
             self.layers, self.x_readouts, self.f_readouts
         ):
-            f_energy = f_readout(data.nodes["species"], features)
-            node_energies, features = layer(
-                features,
-                x_feats,
-                data.nodes["species"],
-                sh,
-                radial_basis,
-                data.senders,
-                data.receivers,
-            )
-            x_energy = x_readout(data.nodes["species"], x_feats)
+            def _layer_fn(features,
+                          _l=layer, _xr=x_readout, _fr=f_readout):
+                _f_energy = _fr(data.nodes["species"], features)
+                _ne, _feat = _l(
+                    features, x_feats, data.nodes["species"],
+                    sh, radial_basis, data.senders, data.receivers,
+                )
+                _xe = _xr(data.nodes["species"], x_feats)
+                return _ne, _feat, _f_energy, _xe
+
+            if self.use_checkpoint:
+                _layer_fn = jax.checkpoint(_layer_fn)
+
+            node_energies, features, f_energy, x_energy = _layer_fn(features)
             # Each term: IrrepsArray with shape (n_atoms, num_heads)
             outputs.append(
                 node_energies.array + x_energy.array + f_energy.array
@@ -419,6 +424,7 @@ def load_foundation_as_multihead(
     num_heads: int,
     config: dict,
     rngs: nnx.Rngs,
+    use_checkpoint: bool = False,
 ) -> tuple:
     """Load a pre-trained RACE checkpoint and create a RACEMultihead model.
 
@@ -458,6 +464,7 @@ def load_foundation_as_multihead(
         atom_energies=config["atom_energies"],
         l_train=True,
         periodic=True,
+        use_checkpoint=use_checkpoint,
         rngs=rngs,
     )
 

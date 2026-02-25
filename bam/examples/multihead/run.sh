@@ -9,58 +9,63 @@ export CUDA_VISIBLE_DEVICES=0,1
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export TF_GPU_ALLOCATOR=cuda_malloc_async
 
-# === Source data paths ===
-OMAT24_TRAIN=/path/to/omat24_train.traj
-OMAT24_VALID=/path/to/omat24_valid.traj
+CONFIG=${1:-input_multihead.json}
 
-LPSC_TRAIN=/path/to/target_train.traj
-LPSC_VALID=/path/to/target_valid.traj
+eval $(python -c "
+import json; c = json.load(open('$CONFIG'))
+for h in c['heads']:
+    name = h['name'].upper()
+    print(f\"{name}_TRAIN_TRAJ={h['train_traj']}\")
+    print(f\"{name}_VALID_TRAJ={h['valid_traj']}\")
+    print(f\"{name}_TRAIN_PATH={h['train_path']}\")
+    print(f\"{name}_VALID_PATH={h['valid_path']}\")
+")
 
 # === Step 1: Build OMat24 replay pkl (built-in ATOM_ENERGIES) ===
-if [ ! -d "data/omat24_train_pkl" ]; then
+if [ ! -d "$REPLAY_OMAT24_TRAIN_PATH" ]; then
     echo "Building OMat24 train pkl (built-in ATOM_ENERGIES)..."
     python -m bam.scripts.build_pkl_multihead \
-        --input $OMAT24_TRAIN \
-        --output data/omat24_train_pkl \
+        --input $REPLAY_OMAT24_TRAIN_TRAJ \
+        --output $REPLAY_OMAT24_TRAIN_PATH \
         --prefix omat24_train \
         --chunk-size 100000
 else
-    echo "data/omat24_train_pkl already exists, skipping."
+    echo "$REPLAY_OMAT24_TRAIN_PATH already exists, skipping."
 fi
 
-if [ ! -d "data/omat24_valid_pkl" ]; then
+if [ ! -d "$REPLAY_OMAT24_VALID_PATH" ]; then
     echo "Building OMat24 valid pkl (built-in ATOM_ENERGIES)..."
     python -m bam.scripts.build_pkl_multihead \
-        --input $OMAT24_VALID \
-        --output data/omat24_valid_pkl \
+        --input $REPLAY_OMAT24_VALID_TRAJ \
+        --output $REPLAY_OMAT24_VALID_PATH \
         --prefix omat24_valid \
         --chunk-size 100000
 else
-    echo "data/omat24_valid_pkl already exists, skipping."
+    echo "$REPLAY_OMAT24_VALID_PATH already exists, skipping."
 fi
 
-# === Step 2: Build LPSC target pkl (fit E0 from data) ===
-if [ ! -d "data/lpsc_train_pkl" ]; then
-    echo "Building LPSC train pkl (fitting atom energies)..."
+# === Step 2: Build target pkl (fit E0 from data) ===
+if [ ! -d "$TARGET_LPSC_TRAIN_PATH" ]; then
+    echo "Building target train pkl (fitting atom energies)..."
     python -m bam.scripts.build_pkl_multihead \
-        --input $LPSC_TRAIN \
-        --output data/lpsc_train_pkl \
+        --input $TARGET_LPSC_TRAIN_TRAJ \
+        --output $TARGET_LPSC_TRAIN_PATH \
         --prefix lpsc_train \
         --fit-energies
 else
-    echo "data/lpsc_train_pkl already exists, skipping."
+    echo "$TARGET_LPSC_TRAIN_PATH already exists, skipping."
 fi
 
-if [ ! -d "data/lpsc_valid_pkl" ]; then
-    echo "Building LPSC valid pkl (using fitted atom_energies.json)..."
+if [ ! -d "$TARGET_LPSC_VALID_PATH" ]; then
+    echo "Building target valid pkl (using fitted atom_energies.json)..."
     python -m bam.scripts.build_pkl_multihead \
-        --input $LPSC_VALID \
-        --output data/lpsc_valid_pkl \
+        --input $TARGET_LPSC_VALID_TRAJ \
+        --output $TARGET_LPSC_VALID_PATH \
         --prefix lpsc_valid \
         --atom-energies atom_energies.json
 else
-    echo "data/lpsc_valid_pkl already exists, skipping."
+    echo "$TARGET_LPSC_VALID_PATH already exists, skipping."
 fi
 
 # === Step 3: Train multihead ===
-python -m bam.training.train_multihead_sharded input_multihead.json
+python -m bam.training.train_multihead_sharded $CONFIG

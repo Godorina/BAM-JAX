@@ -35,6 +35,8 @@
         {
             "name": "replay_omat24",
             "head_idx": 0,
+            "train_traj": "/path/to/omat24_train.traj",
+            "valid_traj": "/path/to/omat24_valid.traj",
             "train_path": "data/omat24_train_pkl",
             "valid_path": "data/omat24_valid_pkl",
             "grad_weight": 0.3,
@@ -45,6 +47,8 @@
         {
             "name": "target_lpsc",
             "head_idx": 1,
+            "train_traj": "/path/to/target_train.traj",
+            "valid_traj": "/path/to/target_valid.traj",
             "train_path": "data/lpsc_train_pkl",
             "valid_path": "data/lpsc_valid_pkl",
             "grad_weight": 1.0,

@@ -21,27 +21,27 @@ for h in c['heads']:
     print(f\"{name}_VALID_PATH={h['valid_path']}\")
 ")
 
-# === Step 1: Build OMat24 replay pkl (built-in ATOM_ENERGIES) ===
-if [ ! -d "$REPLAY_OMAT24_TRAIN_PATH" ]; then
-    echo "Building OMat24 train pkl (built-in ATOM_ENERGIES)..."
+# === Step 1: Build replay pkl (built-in ATOM_ENERGIES) ===
+if [ ! -d "$REPLAY_TRAIN_PATH" ]; then
+    echo "Building replay train pkl (built-in ATOM_ENERGIES)..."
     python -m bam.scripts.build_pkl_multihead \
-        --input $REPLAY_OMAT24_TRAIN_TRAJ \
-        --output $REPLAY_OMAT24_TRAIN_PATH \
-        --prefix omat24_train \
+        --input $REPLAY_TRAIN_TRAJ \
+        --output $REPLAY_TRAIN_PATH \
+        --prefix replay_train \
         --chunk-size 100000
 else
-    echo "$REPLAY_OMAT24_TRAIN_PATH already exists, skipping."
+    echo "$REPLAY_TRAIN_PATH already exists, skipping."
 fi
 
-if [ ! -d "$REPLAY_OMAT24_VALID_PATH" ]; then
-    echo "Building OMat24 valid pkl (built-in ATOM_ENERGIES)..."
+if [ ! -d "$REPLAY_VALID_PATH" ]; then
+    echo "Building replay valid pkl (built-in ATOM_ENERGIES)..."
     python -m bam.scripts.build_pkl_multihead \
-        --input $REPLAY_OMAT24_VALID_TRAJ \
-        --output $REPLAY_OMAT24_VALID_PATH \
-        --prefix omat24_valid \
+        --input $REPLAY_VALID_TRAJ \
+        --output $REPLAY_VALID_PATH \
+        --prefix replay_valid \
         --chunk-size 100000
 else
-    echo "$REPLAY_OMAT24_VALID_PATH already exists, skipping."
+    echo "$REPLAY_VALID_PATH already exists, skipping."
 fi
 
 # === Step 2: Build target pkl (fit E0 from data) ===

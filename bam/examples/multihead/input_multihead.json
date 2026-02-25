@@ -33,12 +33,12 @@
 
     "heads": [
         {
-            "name": "replay_omat24",
+            "name": "replay",
             "head_idx": 0,
             "train_traj": "/path/to/omat24_train.traj",
             "valid_traj": "/path/to/omat24_valid.traj",
-            "train_path": "data/omat24_train_pkl",
-            "valid_path": "data/omat24_valid_pkl",
+            "train_path": "data/replay_train_pkl",
+            "valid_path": "data/replay_valid_pkl",
             "grad_weight": 0.3,
             "energy_weight": 1.0,
             "force_weight": 1.0,

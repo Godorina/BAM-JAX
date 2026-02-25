@@ -29,7 +29,7 @@ from scipy.optimize import minimize
 from tqdm import tqdm
 
 from bam.models.race_nnx import RACE
-from bam.data.data_nnx import Dataset, BucketedDataLoader, MultiDeviceDataLoader, atoms_to_graph
+from bam.data.data_nnx import Dataset, BucketedDataLoader, MultiDeviceDataLoader, atoms_to_graph_with_targets
 from bam.training.losses import huber_loss, mae_loss, mse_loss, LOSS_FUNCTIONS
 from bam.training.sharding import (
     setup_mesh, replicate, replicate_pytree, squeeze_batch,
@@ -416,6 +416,7 @@ def main():
             element = sorted(list(all_elements))
             print(f"  Found elements: {element}")
         config['atom_energies'] = compute_atom_energies(data_path, element)
+        config['atomic_numbers'] = element
 
     print("=" * 70)
     print("Model Evaluation")
@@ -443,7 +444,7 @@ def main():
         scale=1.0,
         avg_n_neighbors=config.get("avg_n_neighbors", 25.0),
         atom_energies=config["atom_energies"],
-        l_train=False,  # Evaluation mode
+        l_train=True,  # Residual energy output (matches training data format)
         rngs=nnx.Rngs(42)
     )
     graphdef, _ = nnx.split(model, nnx.Param)
@@ -480,30 +481,27 @@ def main():
         print(f"Single test file: {test_path}")
 
     else:
-        # ASE-readable format (traj, xyz, POSCAR, etc.) → convert to graph
+        # ASE-readable format (traj, xyz, POSCAR, etc.) → convert to graph with residual energy
         import tempfile
-        from bam.data.data_nnx import atoms_to_graph
 
         print(f"  Converting {test_path.suffix} format to graph data...")
         traj = list(tqdm(iread(str(test_path), index=":"), desc="Reading test structures"))
         cutoff = config.get('cutoff', 6.0)
+        atom_energies_arr = np.array(config['atom_energies'])
+        atomic_numbers = config.get('atomic_numbers', config.get('element'))
+        atom_indices = {int(z): i for i, z in enumerate(atomic_numbers)}
 
         graphs = []
         for atoms in tqdm(traj, desc="Converting to graphs"):
-            g = atoms_to_graph(atoms, cutoff=cutoff)
-            # Replace placeholder zeros with actual DFT values
-            energy = np.array([atoms.get_potential_energy()], dtype=np.float32)
-            forces = atoms.get_forces().astype(np.float32)
-            try:
-                stress = atoms.get_stress(voigt=True).reshape(1, 6).astype(np.float32)
-            except Exception:
-                stress = np.zeros((1, 6), dtype=np.float32)
-
-            g = g._replace(
-                nodes={**g.nodes, 'forces': forces},
-                globals={**g.globals, 'energy': energy, 'stress': stress}
+            g = atoms_to_graph_with_targets(
+                atoms, cutoff=cutoff,
+                atom_energies=atom_energies_arr, atom_indices=atom_indices,
             )
-            graphs.append(g)
+            if g is not None:
+                graphs.append(g)
+
+        if len(graphs) < len(traj):
+            print(f"  Warning: {len(traj) - len(graphs)} structures had no neighbors (skipped)")
 
         # Save as temporary pkl for evaluate_verbose()
         tmp_path = Path(tempfile.mktemp(suffix='.pkl'))

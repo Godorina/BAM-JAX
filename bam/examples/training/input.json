@@ -1,5 +1,7 @@
 {
     "cutoff": 6.0,
+    "train_traj": "../data/3BPA/train_300K_train.xyz",
+    "valid_traj": "../data/3BPA/train_300K_val.xyz",
     "train_path": "data/train_pkl",
     "valid_path": "data/valid_pkl",
     "atom_energies_path": "atom_energies.json",

@@ -1,0 +1,5 @@
+{
+    "ckpt": "../ckpt_best.pkl",
+    "test": "../../data/3BPA/test_300K.xyz",
+    "data": "../../data/3BPA/train_300K.xyz"
+}

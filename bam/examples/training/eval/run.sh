@@ -8,4 +8,5 @@ export TF_GPU_ALLOCATOR=cuda_malloc_async
 
 CONFIG=${1:-input.json}
 
-python -m bam.inference.eval $CONFIG
+# Same as training, but input.json has "evaluate_tag": true
+python -m bam.training.train_sharded $CONFIG

@@ -40,6 +40,6 @@
     "predict": {
         "evaluate_tag": true,
         "model": "ckpt_best.pkl",
-        "test_path": "data/test_pkl"
+        "test_path": "../../data/test_pkl"
     }
 }

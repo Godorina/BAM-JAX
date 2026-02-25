@@ -6,8 +6,8 @@ export CUDA_VISIBLE_DEVICES=2
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export TF_GPU_ALLOCATOR=cuda_malloc_async
 
-TRAIN_TRAJ=/path/to/train.traj
-VALID_TRAJ=/path/to/valid.traj
+TRAIN_TRAJ=../data/3BPA/train_300K_train.xyz
+VALID_TRAJ=../data/3BPA/train_300K_val.xyz
 
 # Step 1: Fit atom energies + build train pkl (skip if already exists)
 if [ ! -d "data/train_pkl" ]; then

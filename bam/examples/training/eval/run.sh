@@ -9,5 +9,5 @@ export PYTHONUNBUFFERED=1
 
 CONFIG=${1:-input.json}
 
-# Same as training, but input.json has "evaluate_tag": true
-python -m bam.training.train_sharded $CONFIG
+# 평가 실행
+python -m bam.training.train_sharded $CONFIG 2>&1 | tee eval.log

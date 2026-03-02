@@ -440,10 +440,20 @@ def load_foundation_as_multihead(
         rngs: Random number generators.
 
     Returns:
-        Tuple of (graphdef, params) for the multihead model.
+        Tuple of (graphdef, params, load_info) for the multihead model.
+        load_info contains foundation checkpoint metadata and loading statistics.
     """
     with open(ckpt_path, 'rb') as f:
         ckpt = pickle.load(f)
+
+    # Extract foundation checkpoint metadata
+    foundation_info = {
+        'ckpt_path': ckpt_path,
+        'source_epoch': ckpt.get('epoch', None),
+        'source_step': ckpt.get('step', None),
+        'source_val_loss': ckpt.get('best_val_loss', None),
+        'used_ema': 'ema_params' in ckpt,
+    }
 
     foundation_params = ckpt.get('ema_params', ckpt['params'])
 
@@ -564,11 +574,16 @@ def load_foundation_as_multihead(
         new_leaves,
     )
 
+    foundation_info['copied'] = copied
+    foundation_info['repeated'] = repeated
+    foundation_info['skipped'] = skipped
+    foundation_info['total_params'] = len(multihead_flat)
+
     print(f"Foundation loading: copied {copied}, "
           f"repeated {repeated} (readout expansion), "
           f"skipped {skipped}")
 
-    return graphdef, multihead_params
+    return graphdef, multihead_params, foundation_info
 
 
 if __name__ == "__main__":

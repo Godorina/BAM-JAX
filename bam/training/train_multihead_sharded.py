@@ -127,21 +127,35 @@ class BatchLogger:
 def extract_per_device_batch_metadata(
     batch, n_devices: int
 ) -> List[Tuple[int, int, int]]:
-    """Extract per-device (n_graphs, n_nodes, n_edges) from a stacked batch."""
+    """Extract per-device (n_graphs, n_nodes, n_edges) from addressable shards only."""
     per_device_metadata = []
 
-    n_node_array = np.asarray(batch.n_node)
-    n_edge_array = np.asarray(batch.n_edge)
+    # Multi-host: only access addressable (local) shards
+    if hasattr(batch.n_node, 'addressable_shards'):
+        for shard_n, shard_e in zip(
+            batch.n_node.addressable_shards, batch.n_edge.addressable_shards
+        ):
+            device_n_node = np.asarray(shard_n.data).reshape(-1)
+            device_n_edge = np.asarray(shard_e.data).reshape(-1)
 
-    for i in range(n_devices):
-        device_n_node = n_node_array[i]
-        device_n_edge = n_edge_array[i]
+            n_graphs = int(device_n_node.shape[0]) - 1
+            n_nodes = int(np.sum(device_n_node[:-1]))
+            n_edges = int(np.sum(device_n_edge[:-1]))
 
-        n_graphs = int(device_n_node.shape[0]) - 1  # Exclude padding graph
-        n_nodes = int(np.sum(device_n_node[:-1]))
-        n_edges = int(np.sum(device_n_edge[:-1]))
+            per_device_metadata.append((n_graphs, n_nodes, n_edges))
+    else:
+        n_node_array = np.asarray(batch.n_node)
+        n_edge_array = np.asarray(batch.n_edge)
 
-        per_device_metadata.append((n_graphs, n_nodes, n_edges))
+        for i in range(n_devices):
+            device_n_node = n_node_array[i]
+            device_n_edge = n_edge_array[i]
+
+            n_graphs = int(device_n_node.shape[0]) - 1
+            n_nodes = int(np.sum(device_n_node[:-1]))
+            n_edges = int(np.sum(device_n_edge[:-1]))
+
+            per_device_metadata.append((n_graphs, n_nodes, n_edges))
 
     return per_device_metadata
 
@@ -582,6 +596,12 @@ class HeadBatchStream:
         self.head_name = head_config["name"]
         self.all_files = _get_pkl_files(head_config["train_path"])
         self.n_files = len(self.all_files)
+        if self.n_files == 0:
+            raise FileNotFoundError(
+                f"Head '{self.head_name}' (idx={self.head_idx}): "
+                f"no .pkl files found in '{head_config['train_path']}'. "
+                f"Run data preprocessing first."
+            )
         self.seed = seed
         self.epoch = epoch
         self.batch_size = batch_size
@@ -688,15 +708,22 @@ def train_multihead_sharded(config: Dict):
     # Model initialization
     foundation_ckpt = config.get("foundation_ckpt")
 
-    if foundation_ckpt and not config.get('restart', False):
-        print(f"Loading foundation model from {foundation_ckpt}", file=fout)
-        graphdef, params = load_foundation_as_multihead(
+    if foundation_ckpt:
+        graphdef, params, load_info = load_foundation_as_multihead(
             ckpt_path=foundation_ckpt,
             num_heads=num_heads,
             config=config,
             rngs=model_rngs,
             use_checkpoint=config.get('use_checkpoint', False),
         )
+        print(f"Foundation model loaded: {foundation_ckpt}", file=fout)
+        if load_info.get('source_epoch') is not None:
+            print(f"  Source epoch: {load_info['source_epoch']}", file=fout)
+        if load_info.get('source_step') is not None:
+            print(f"  Source step: {load_info['source_step']}", file=fout)
+        print(f"  Param transfer: {load_info['copied']} copied, "
+              f"{load_info['repeated']} expanded, "
+              f"{load_info['skipped']} skipped", file=fout)
     else:
         model = RACEMultihead(
             n_species=len(config["atom_energies"]),
@@ -851,13 +878,15 @@ def train_multihead_sharded(config: Dict):
                 elapsed = time.time() - epoch_step_start
                 unrep_schedule = unreplicate_pytree(schedule_state)
                 lr = config['learning_rate'] * float(unrep_schedule.scale)
-                print(f"step {current_step} (epoch {epoch+1}, {elapsed:.1f}s, LR={lr:.2e})",
+                n_epochs = config["n_epochs"]
+                print(f"step {current_step} (epoch {epoch+1}/{n_epochs}, {elapsed:.1f}s, LR={lr:.2e})",
                       file=fout)
                 for i, head_cfg in enumerate(head_configs):
                     stream = streams[head_cfg["head_idx"]]
                     cycle_str = f" cyc={stream.cycle_count}" if stream.cycle_count > 0 else ""
+                    file_str = f" file={stream.files_consumed}/{stream.n_files}"
                     print(
-                        f"  [{head_cfg['name']}{cycle_str}] "
+                        f"  [{head_cfg['name']}{cycle_str}{file_str}] "
                         f"loss={float(metrics['per_head_loss'][i]):.6f} "
                         f"E={float(metrics['per_head_energy_loss'][i]):.6f} "
                         f"F={float(metrics['per_head_force_loss'][i]):.6f} "
@@ -978,12 +1007,24 @@ if __name__ == "__main__":
     from pathlib import Path
     from bam.data.atom_energies import ATOM_ENERGIES
 
+    # Multi-node distributed initialization
+    num_processes = int(os.environ.get("JAX_NUM_PROCESSES", 1))
+    if num_processes > 1:
+        coordinator_address = os.environ["JAX_COORDINATOR_ADDRESS"]
+        process_id = int(os.environ["JAX_PROCESS_INDEX"])
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=num_processes,
+            process_id=process_id,
+        )
+
     print("=" * 70)
     print("JAX Multihead Sharded Training (Multi-GPU)")
     print("=" * 70)
     print(f"JAX version: {jax.__version__}")
     print(f"Devices: {jax.devices()}")
-    print(f"Device count: {jax.local_device_count()}")
+    print(f"Device count: {jax.device_count()} (local: {jax.local_device_count()})")
+    print(f"Process index: {jax.process_index()} / {jax.process_count()}")
     print("=" * 70)
 
     # Load config

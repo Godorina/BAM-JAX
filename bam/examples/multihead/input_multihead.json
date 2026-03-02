@@ -1,5 +1,5 @@
 {
-    "foundation_ckpt": "ckpt_foundation.pkl",
+    "foundation_ckpt": "omat_data/ckpt_best.pkl",
 
     "lmax": 3,
     "hidden_irreps": "640x0e + 320x1o + 128x2e + 128x3o",
@@ -20,7 +20,7 @@
     "huber_delta": 0.02,
     "ema_decay": 0.99,
     "use_checkpoint": true,
-    "max_nodes_per_batch": 512,
+    "max_nodes_per_batch": 256,
 
     "lr_schedule_patience": 10,
     "lr_schedule_factor": 0.5,
@@ -28,15 +28,16 @@
 
     "log_every": 10,
     "seed": 42,
-    "restart": false,
+    "restart": true,
     "fname_log": "loss_multihead.out",
 
+    "multihead": true,
     "heads": [
         {
             "name": "replay",
             "head_idx": 0,
-            "train_traj": "/path/to/omat24_train.traj",
-            "valid_traj": "/path/to/omat24_valid.traj",
+            "train_traj": "omat_data/omat24_sampled_10pct_train.traj",
+            "valid_traj": "omat_data/omat24_sampled_10pct_valid.traj",
             "train_path": "data/replay_train_pkl",
             "valid_path": "data/replay_valid_pkl",
             "grad_weight": 0.3,
@@ -45,15 +46,21 @@
             "stress_weight": 1.0
         },
         {
-            "name": "target_lpsc",
+            "name": "target",
             "head_idx": 1,
-            "train_traj": "/path/to/target_train.traj",
-            "valid_traj": "/path/to/target_valid.traj",
-            "train_path": "data/lpsc_train_pkl",
-            "valid_path": "data/lpsc_valid_pkl",
+            "train_traj": [
+                "mptrj_salex_data/train_9_1_1420562.traj",
+                "mptrj_salex_data/sAlex_dataset_train_10447765.traj"
+            ],
+            "valid_traj": [
+                "mptrj_salex_data/valid_9_1_159833.traj",
+                "mptrj_salex_data/sAlex_dataset_validation_553218.traj"
+            ],
+            "train_path": "data/target_train_pkl",
+            "valid_path": "data/target_valid_pkl",
             "grad_weight": 1.0,
             "energy_weight": 1.0,
-            "force_weight": 100.0,
+            "force_weight": 10.0,
             "stress_weight": 1.0
         }
     ]

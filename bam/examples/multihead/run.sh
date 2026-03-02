@@ -1,11 +1,11 @@
 #!/bin/bash
 eval "$(conda shell.bash hook 2>/dev/null)"
-conda activate bam_jax_nequip
+conda activate bam_jax
 
 # Move to script directory
 cd "$(dirname "$0")"
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=2
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export TF_GPU_ALLOCATOR=cuda_malloc_async
 
@@ -15,8 +15,13 @@ eval $(python -c "
 import json; c = json.load(open('$CONFIG'))
 for h in c['heads']:
     name = h['name'].upper()
-    print(f\"{name}_TRAIN_TRAJ={h['train_traj']}\")
-    print(f\"{name}_VALID_TRAJ={h['valid_traj']}\")
+    for key in ['train_traj', 'valid_traj']:
+        val = h[key]
+        envkey = f\"{name}_{key.upper()}\"
+        if isinstance(val, list):
+            print(f'{envkey}=\"{chr(32).join(val)}\"')
+        else:
+            print(f'{envkey}=\"{val}\"')
     print(f\"{name}_TRAIN_PATH={h['train_path']}\")
     print(f\"{name}_VALID_PATH={h['valid_path']}\")
 ")
@@ -44,28 +49,30 @@ else
     echo "$REPLAY_VALID_PATH already exists, skipping."
 fi
 
-# === Step 2: Build target pkl (fit E0 from data) ===
-if [ ! -d "$TARGET_LPSC_TRAIN_PATH" ]; then
+# === Step 2: Build target pkl (fit E0 from data, supports multiple traj files) ===
+if [ ! -d "$TARGET_TRAIN_PATH" ]; then
     echo "Building target train pkl (fitting atom energies)..."
-    python -m bam.scripts.build_pkl_multihead \
-        --input $TARGET_LPSC_TRAIN_TRAJ \
-        --output $TARGET_LPSC_TRAIN_PATH \
+    python -m bam.scripts.build_pkl_multi_input \
+        --input $TARGET_TRAIN_TRAJ \
+        --output $TARGET_TRAIN_PATH \
         --prefix lpsc_train \
+        --chunk-size 100000 \
         --fit-energies
 else
-    echo "$TARGET_LPSC_TRAIN_PATH already exists, skipping."
+    echo "$TARGET_TRAIN_PATH already exists, skipping."
 fi
 
-if [ ! -d "$TARGET_LPSC_VALID_PATH" ]; then
-    echo "Building target valid pkl (using fitted atom_energies.json)..."
-    python -m bam.scripts.build_pkl_multihead \
-        --input $TARGET_LPSC_VALID_TRAJ \
-        --output $TARGET_LPSC_VALID_PATH \
+if [ ! -d "$TARGET_VALID_PATH" ]; then
+    echo "Building target valid pkl (using fitted atom_energies_target.json)..."
+    python -m bam.scripts.build_pkl_multi_input \
+        --input $TARGET_VALID_TRAJ \
+        --output $TARGET_VALID_PATH \
         --prefix lpsc_valid \
-        --atom-energies atom_energies.json
+        --chunk-size 100000 \
+        --atom-energies atom_energies_target.json
 else
-    echo "$TARGET_LPSC_VALID_PATH already exists, skipping."
+    echo "$TARGET_VALID_PATH already exists, skipping."
 fi
 
 # === Step 3: Train multihead ===
-python -m bam.training.train_multihead_sharded $CONFIG
+python -m bam.training.train_unified $CONFIG

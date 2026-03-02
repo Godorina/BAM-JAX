@@ -877,6 +877,7 @@ def evaluate_per_head(
                 if batch_idx >= synced_max:
                     break
                 batch_idx += 1
+                graph_indices = getattr(info, 'graph_indices_per_device', None)
                 metrics = eval_step(graphdef, params_replicated, batch)
                 for k in totals:
                     totals[k] += float(metrics[k])
@@ -889,6 +890,7 @@ def evaluate_per_head(
                         epoch=epoch, mode='valid', file_name=file_name,
                         batch_idx=batch_idx, per_device_metadata=per_device_metadata,
                         head_name=head_name,
+                        graph_indices_per_device=graph_indices,
                     )
 
         n_g = max(totals['n_graphs'], 1)
@@ -1432,7 +1434,8 @@ def _train_loop_multihead(
                 stream = streams[h]
                 batch, info = stream.next_batch()
                 head_batches.append(batch)
-                head_batch_meta.append((head_cfg, stream, batch))
+                graph_indices = getattr(info, 'graph_indices_per_device', None)
+                head_batch_meta.append((head_cfg, stream, batch, graph_indices))
 
             head_args = []
             for i, head_cfg in enumerate(head_configs):
@@ -1450,7 +1453,7 @@ def _train_loop_multihead(
 
             current_step = int(np.asarray(step))
 
-            for head_cfg, stream, batch in head_batch_meta:
+            for head_cfg, stream, batch, graph_indices in head_batch_meta:
                 per_device_metadata = extract_per_device_batch_metadata(
                     batch, jax.local_device_count()
                 )
@@ -1458,6 +1461,7 @@ def _train_loop_multihead(
                     epoch, 'train', Path(stream._current_file).name,
                     stream.batches_yielded, per_device_metadata,
                     head_name=head_cfg["name"],
+                    graph_indices_per_device=graph_indices,
                 )
 
             if current_step % log_every == 0:

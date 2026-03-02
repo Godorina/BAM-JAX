@@ -513,12 +513,13 @@ def load_foundation_as_multihead(
     }
 
     new_leaves = []
-    copied = 0
-    repeated = 0
-    skipped = 0
+    copied_size = 0
+    repeated_size = 0
+    skipped_size = 0
 
     for path, value in multihead_flat:
         key_str = path_to_str(path)
+        param_size = int(value.size)
 
         # Handle per-head shifts/scales from foundation's scalar shift/scale
         if 'shifts' in key_str or 'scales' in key_str:
@@ -532,22 +533,22 @@ def load_foundation_as_multihead(
                 new_leaves.append(
                     jnp.full((num_heads,), float(foundation_val))
                 )
-                copied += 1
+                copied_size += param_size
             else:
                 new_leaves.append(value)
-                skipped += 1
+                skipped_size += param_size
 
         elif key_str in foundation_lookup:
             # Direct match (backbone params)
             foundation_val = foundation_lookup[key_str]
             if foundation_val.shape == value.shape:
                 new_leaves.append(foundation_val)
-                copied += 1
+                copied_size += param_size
             else:
                 print(f"Shape mismatch for {key_str}: "
                       f"foundation {foundation_val.shape} vs multihead {value.shape}")
                 new_leaves.append(value)
-                skipped += 1
+                skipped_size += param_size
 
         else:
             # Try normalized path (for readout params with different irreps names)
@@ -558,30 +559,31 @@ def load_foundation_as_multihead(
                 new_val = jnp.repeat(foundation_val, num_heads, axis=-1)
                 if new_val.shape == value.shape:
                     new_leaves.append(new_val)
-                    repeated += 1
+                    repeated_size += param_size
                 else:
                     print(f"Shape mismatch after repeat for {key_str}: "
                           f"got {new_val.shape} vs expected {value.shape}")
                     new_leaves.append(value)
-                    skipped += 1
+                    skipped_size += param_size
             else:
                 print(f"No foundation match for: {key_str}")
                 new_leaves.append(value)
-                skipped += 1
+                skipped_size += param_size
 
     multihead_params = jax.tree_util.tree_unflatten(
         jax.tree_util.tree_structure(multihead_params),
         new_leaves,
     )
 
-    foundation_info['copied'] = copied
-    foundation_info['repeated'] = repeated
-    foundation_info['skipped'] = skipped
-    foundation_info['total_params'] = len(multihead_flat)
+    total_size = copied_size + repeated_size + skipped_size
+    foundation_info['copied_size'] = copied_size
+    foundation_info['repeated_size'] = repeated_size
+    foundation_info['skipped_size'] = skipped_size
+    foundation_info['total_size'] = total_size
 
-    print(f"Foundation loading: copied {copied}, "
-          f"repeated {repeated} (readout expansion), "
-          f"skipped {skipped}")
+    print(f"Foundation loading: backbone {copied_size:,}, "
+          f"readout(expanded) {repeated_size:,}, "
+          f"not matched {skipped_size:,} / total {total_size:,}")
 
     return graphdef, multihead_params, foundation_info
 

@@ -716,14 +716,24 @@ def train_multihead_sharded(config: Dict):
             rngs=model_rngs,
             use_checkpoint=config.get('use_checkpoint', False),
         )
+        total = load_info['total_size']
+        copied = load_info['copied_size']
+        expanded = load_info['repeated_size']
+        skipped = load_info['skipped_size']
+        cp = 100 * copied / total if total > 0 else 0
+        ep = 100 * expanded / total if total > 0 else 0
         print(f"Foundation model loaded: {foundation_ckpt}", file=fout)
         if load_info.get('source_epoch') is not None:
-            print(f"  Source epoch: {load_info['source_epoch']}", file=fout)
+            print(f"  Trained epochs: {load_info['source_epoch']}", file=fout)
         if load_info.get('source_step') is not None:
-            print(f"  Source step: {load_info['source_step']}", file=fout)
-        print(f"  Param transfer: {load_info['copied']} copied, "
-              f"{load_info['repeated']} expanded, "
-              f"{load_info['skipped']} skipped", file=fout)
+            print(f"  Trained steps: {load_info['source_step']}", file=fout)
+        if load_info.get('source_val_loss') is not None:
+            print(f"  Best val_loss: {load_info['source_val_loss']:.6f}", file=fout)
+        print(f"  Param transfer (total {total:,}):", file=fout)
+        print(f"    Backbone (direct copy):      {copied:>13,} ({cp:.2f}%)", file=fout)
+        print(f"    Readout  (1-head -> {num_heads}-head): {expanded:>13,} ({ep:.2f}%)", file=fout)
+        if skipped > 0:
+            print(f"    NOT matched (random init):   {skipped:>13,} ({sp:.2f}%) *** WARNING ***", file=fout)
     else:
         model = RACEMultihead(
             n_species=len(config["atom_energies"]),

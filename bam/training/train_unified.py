@@ -1610,22 +1610,29 @@ def train_unified(config: Dict):
 
     # Foundation model provenance
     if is_multihead and load_info is not None:
+        total = load_info['total_size']
+        copied = load_info['copied_size']
+        expanded = load_info['repeated_size']
+        skipped = load_info['skipped_size']
+        cp = 100 * copied / total if total > 0 else 0
+        ep = 100 * expanded / total if total > 0 else 0
+        sp = 100 * skipped / total if total > 0 else 0
         print("-" * 70, file=fout)
         print("Foundation model loaded:", file=fout)
         print(f"  Path: {load_info['ckpt_path']}", file=fout)
         if load_info['source_epoch'] is not None:
-            print(f"  Source epoch: {load_info['source_epoch']}", file=fout)
+            print(f"  Trained epochs: {load_info['source_epoch']}", file=fout)
         if load_info['source_step'] is not None:
-            print(f"  Source step: {load_info['source_step']}", file=fout)
+            print(f"  Trained steps: {load_info['source_step']}", file=fout)
         if load_info['source_val_loss'] is not None:
-            print(f"  Source val_loss: {load_info['source_val_loss']:.6f}", file=fout)
+            print(f"  Best val_loss: {load_info['source_val_loss']:.6f}", file=fout)
         print(f"  Used EMA params: {load_info['used_ema']}", file=fout)
-        print(f"  Param transfer: {load_info['copied']} copied, "
-              f"{load_info['repeated']} expanded (readout), "
-              f"{load_info['skipped']} skipped "
-              f"(total {load_info['total_params']})", file=fout)
-        if load_info['skipped'] > 0:
-            print(f"  WARNING: {load_info['skipped']} params not matched!", file=fout)
+        num_heads = len(config['heads'])
+        print(f"  Param transfer (total {total:,}):", file=fout)
+        print(f"    Backbone (direct copy):      {copied:>13,} ({cp:.2f}%)", file=fout)
+        print(f"    Readout  (1-head -> {num_heads}-head): {expanded:>13,} ({ep:.2f}%)", file=fout)
+        if skipped > 0:
+            print(f"    NOT matched (random init):   {skipped:>13,} ({sp:.2f}%) *** WARNING ***", file=fout)
         print("-" * 70, file=fout)
     elif is_multihead:
         print("Model initialized from scratch (no foundation_ckpt)", file=fout)

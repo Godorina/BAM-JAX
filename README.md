@@ -67,7 +67,7 @@ pip install "flax>=0.12.0" "e3nn-jax>=0.20.8" "jraph==0.0.6.dev0" "optax>=0.2.5"
 ## Step 4: Install BAM
 
 ```bash
-git clone https://github.com/myung-group/BAM-JAX.git
+git clone https://github.com/Godorina/BAM-JAX.git
 cd BAM-JAX
 pip install -e .
 ```

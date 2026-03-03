@@ -1,12 +1,12 @@
 # Installation
 
-![Python](https://img.shields.io/badge/Python-≥3.12-blue)
+![Python](https://img.shields.io/badge/Python-≥3.9-blue)
 ![JAX](https://img.shields.io/badge/JAX-≥0.8.0-red)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Prerequisites
 
-- Python >= 3.12
+- Python >= 3.9
 - CUDA 12.x (for GPU support)
 - conda (Miniconda or Miniforge recommended)
 
@@ -21,6 +21,9 @@
 | optax | >= 0.2.5 |
 | ASE | >= 3.27.0 |
 | matscipy | >= 1.2.0 |
+| numpy | - |
+| scipy | - |
+| tqdm | - |
 
 ## Step 1: Create Conda Environment
 
@@ -59,7 +62,7 @@ pip install "jax>=0.8.0"
 ## Step 3: Install Dependencies
 
 ```bash
-pip install "flax>=0.12.0" "e3nn-jax>=0.20.8" "jraph==0.0.6.dev0" "optax>=0.2.5" "ase>=3.27.0" "matscipy>=1.2.0"
+pip install "flax>=0.12.0" "e3nn-jax>=0.20.8" "jraph==0.0.6.dev0" "optax>=0.2.5" "ase>=3.27.0" "matscipy>=1.2.0" numpy scipy tqdm
 ```
 
 > **Note:** `jraph` only provides dev releases on PyPI, so `0.0.6.dev0` is the correct version to install.
@@ -146,7 +149,7 @@ python -m bam.scripts.build_pkl --input <train.xyz> --output data/train_pkl --pr
 python -m bam.scripts.build_pkl --input <valid.xyz> --output data/valid_pkl --prefix valid --atom-energies atom_energies.json
 
 # Train
-python -m bam.training.train_sharded input.json
+python -m bam.training.train_unified input.json
 ```
 
 Or simply use the provided script:
@@ -180,7 +183,7 @@ BAM-JAX/
 │   ├── lammps/          # LAMMPS integration
 │   ├── models/          # NequIP and RACE model architectures
 │   ├── scripts/         # Data preprocessing scripts
-│   └── training/        # Training loops (sharded, multi-head)
+│   └── training/        # Training loops (unified, multi-head)
 ├── pyproject.toml
 └── setup.py
 ```
@@ -213,6 +216,6 @@ Use `CUDA_VISIBLE_DEVICES` to select specific GPUs:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1    # use GPU 0 and 1
-python -m bam.training.train_sharded input.json
+python -m bam.training.train_unified input.json
 ```
 ~

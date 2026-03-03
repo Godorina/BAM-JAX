@@ -192,7 +192,7 @@ def default_collate_fn(
     graphs: List[jraph.GraphsTuple],
     batch_size: int,
     node_bucket_size: int = 128,
-    edge_bucket_size: int = 4096
+    edge_bucket_size: int = 1024
 ) -> jraph.GraphsTuple:
 
     if len(graphs) == 0:
@@ -348,6 +348,7 @@ class BucketedDataLoader(nnx.Object): # 비슷한 원자 수(노드 수)의 분�
         drop_last: bool = False,
         rngs: nnx.Rngs | None = None,
         max_nodes_per_batch=256,
+        max_edges_per_batch=None,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -356,6 +357,7 @@ class BucketedDataLoader(nnx.Object): # 비슷한 원자 수(노드 수)의 분�
         self.drop_last = drop_last
         self.collate_fn = default_collate_fn
         self.max_node_per_batch = max_nodes_per_batch
+        self.max_edge_per_batch = max_edges_per_batch
 
         if rngs is None:
             rngs = nnx.Rngs(0)
@@ -418,23 +420,48 @@ class BucketedDataLoader(nnx.Object): # 비슷한 원자 수(노드 수)의 분�
             graphs = []
             graph_indices = []  # Track actual graph indices
             n_nodes = 0
+            n_edges = 0
             curr_idx = self.bucket_idx
 
             # Get global offset from dataset
             global_offset = getattr(self.dataset, 'global_start_idx', 0)
 
             for _ in range(n_to_take):
+                if curr_idx >= len(bucket):
+                    break
                 local_idx = bucket[curr_idx]  # Index within this process's portion
                 curr_graph = self.dataset.graphs[local_idx]
-                n_nodes += curr_graph.n_node[0]
-                if n_nodes >= self.max_node_per_batch:
-                    break
+                g_nodes = int(curr_graph.n_node[0])
+                g_edges = int(curr_graph.n_edge[0])
+
+                # First graph is always included (prevents data loss for large graphs).
+                # Size limits apply from the second graph onward.
+                if len(graphs) > 0:
+                    if self.max_edge_per_batch and g_edges >= self.max_edge_per_batch:
+                        curr_idx += 1
+                        continue
+                    if g_nodes >= self.max_node_per_batch:
+                        curr_idx += 1
+                        continue
+                    if n_nodes + g_nodes >= self.max_node_per_batch:
+                        break
+                    if self.max_edge_per_batch and n_edges + g_edges >= self.max_edge_per_batch:
+                        break
+
+                n_nodes += g_nodes
+                n_edges += g_edges
                 curr_idx += 1
                 graphs.append(curr_graph)
                 # Store global index (local_idx + global_offset)
                 graph_indices.append(global_offset + local_idx)
 
             self.bucket_idx = curr_idx
+
+            # All remaining graphs in this bucket were too large — move to next bucket
+            if len(graphs) == 0:
+                self.current_bucket += 1
+                self.bucket_idx = 0
+                continue
 
             return self.collate_fn(graphs, self.batch_size), graph_indices
 
@@ -528,6 +555,18 @@ def stack_batches_for_devices(
     max_nodes = max(node_sizes)
     max_edges = max(edge_sizes)
     max_graphs = max(graph_sizes)
+
+    # Multi-host: allgather to sync max sizes across all hosts.
+    # Without this, different hosts pad to different sizes
+    # → different JIT compilations → pmean collective ID mismatch → deadlock.
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+        local_maxes = jnp.array([max_nodes, max_edges, max_graphs], dtype=jnp.int32)
+        global_maxes = multihost_utils.process_allgather(local_maxes, tiled=False)
+        global_maxes = jax.device_get(global_maxes)
+        max_nodes = int(global_maxes[:, 0].max())
+        max_edges = int(global_maxes[:, 1].max())
+        max_graphs = int(global_maxes[:, 2].max())
 
     # Pad all batches to same size
     padded_batches = []

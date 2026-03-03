@@ -560,97 +560,60 @@ def make_sharded_train_step(
     return jax.jit(sharded_step)
 
 
-def make_fused_multihead_train_step(
-    optimizer, mesh, loss_fn, num_heads, num_head_configs, ema_decay=0.99,
-):
-    """Fused gradient accumulation + optimizer for multihead training."""
-    N_ARGS_PER_HEAD = 5  # batch, energy_w, force_w, stress_w, grad_w
+def make_per_head_grad_step(mesh, loss_fn, num_heads):
+    """Create a sharded gradient step for a single head.
 
-    def per_device_step(graphdef, params, opt_state, schedule_state,
-                        ema_params, step, *head_args):
-        acc_grads = None
-        total_gw = jnp.float32(0.0)
-        per_head_losses = []
-        per_head_e_losses = []
-        per_head_f_losses = []
-        per_head_s_losses = []
-        per_head_grad_norms = []
-        per_head_n_graphs = []
-        per_head_n_atoms = []
+    Returns (grads, loss, aux, grad_norm) with pmean already applied.
+    Each head call is a separate JIT, so different heads can have different
+    batch shapes without causing cross-head compilation mismatches.
+    """
 
-        for i in range(num_head_configs):
-            base = i * N_ARGS_PER_HEAD
-            batch_i = squeeze_batch(head_args[base])
-            e_w = head_args[base + 1]
-            f_w = head_args[base + 2]
-            s_w = head_args[base + 3]
-            g_w = head_args[base + 4]
+    def per_device_grad(graphdef, params, batch, energy_w, force_w, stress_w):
+        batch = squeeze_batch(batch)
 
-            def loss_fn_i(params, _b=batch_i, _ew=e_w, _fw=f_w, _sw=s_w):
-                return compute_loss_multihead(
-                    graphdef, params, _b, _ew, _fw, _sw, loss_fn, num_heads,
-                )
+        def _loss_fn(params):
+            return compute_loss_multihead(
+                graphdef, params, batch,
+                energy_w, force_w, stress_w, loss_fn, num_heads,
+            )
 
-            (loss_i, aux_i), grads_i = jax.value_and_grad(
-                loss_fn_i, has_aux=True,
-            )(params)
+        (loss, aux), grads = jax.value_and_grad(_loss_fn, has_aux=True)(params)
 
-            weighted = jax.tree.map(lambda g: g * g_w, grads_i)
-            if acc_grads is None:
-                acc_grads = weighted
-            else:
-                acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, weighted)
-            total_gw = total_gw + g_w
+        grads = jax.lax.pmean(grads, axis_name='dp')
+        loss = jax.lax.pmean(loss, axis_name='dp')
+        aux = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name='dp'), aux)
+        grad_norm = optax.global_norm(grads)
 
-            per_head_losses.append(loss_i)
-            per_head_e_losses.append(aux_i['energy_loss'])
-            per_head_f_losses.append(aux_i['force_loss'])
-            per_head_s_losses.append(aux_i['stress_loss'])
-            per_head_grad_norms.append(optax.global_norm(grads_i))
-            per_head_n_graphs.append(aux_i['n_graphs'])
-            per_head_n_atoms.append(aux_i['n_atoms'])
+        return grads, loss, aux, grad_norm
 
-        acc_grads = jax.tree.map(lambda g: g / total_gw, acc_grads)
-        acc_grads = jax.lax.pmean(acc_grads, axis_name='dp')
-        combined_grad_norm = optax.global_norm(acc_grads)
+    sharded_fn = shard_map(
+        per_device_grad, mesh=mesh,
+        in_specs=(P(), P(), P('dp'), P(), P(), P()),
+        out_specs=(P(), P(), P(), P()),
+    )
+    return jax.jit(sharded_fn)
 
-        updates, new_opt = optimizer.update(acc_grads, opt_state, params)
+
+def make_multihead_optimizer_step(optimizer, mesh, ema_decay=0.99):
+    """Create a sharded optimizer update step that takes pre-computed gradients.
+
+    Grads are already pmean'd from per-head steps, so no collective needed here.
+    """
+
+    def per_device_opt(params, opt_state, schedule_state, ema_params, step, grads):
+        updates, new_opt = optimizer.update(grads, opt_state, params)
         updates = optax.tree_utils.tree_scale(schedule_state.scale, updates)
         new_p = optax.apply_updates(params, updates)
         new_ema = jax.tree.map(
             lambda ema, p: ema_decay * ema + (1 - ema_decay) * p,
             ema_params, new_p,
         )
+        return new_p, new_opt, new_ema, step + 1
 
-        metrics = {
-            'combined_grad_norm': combined_grad_norm,
-            'per_head_loss': jax.lax.pmean(
-                jnp.stack(per_head_losses), axis_name='dp'),
-            'per_head_energy_loss': jax.lax.pmean(
-                jnp.stack(per_head_e_losses), axis_name='dp'),
-            'per_head_force_loss': jax.lax.pmean(
-                jnp.stack(per_head_f_losses), axis_name='dp'),
-            'per_head_stress_loss': jax.lax.pmean(
-                jnp.stack(per_head_s_losses), axis_name='dp'),
-            'per_head_grad_norm': jax.lax.pmean(
-                jnp.stack(per_head_grad_norms), axis_name='dp'),
-            'per_head_n_graphs': jax.lax.pmean(
-                jnp.stack(per_head_n_graphs), axis_name='dp'),
-            'per_head_n_atoms': jax.lax.pmean(
-                jnp.stack(per_head_n_atoms), axis_name='dp'),
-        }
-        return new_p, new_opt, new_ema, step + 1, metrics
-
-    fixed_specs = (P(), P(), P(), P(), P(), P())
-    head_specs = tuple(
-        spec
-        for _ in range(num_head_configs)
-        for spec in (P('dp'), P(), P(), P(), P())
-    )
     sharded_fn = shard_map(
-        per_device_step, mesh=mesh,
-        in_specs=fixed_specs + head_specs,
-        out_specs=(P(), P(), P(), P(), P()),
+        per_device_opt, mesh=mesh,
+        in_specs=(P(), P(), P(), P(), P(), P()),
+        out_specs=(P(), P(), P(), P()),
     )
     return jax.jit(sharded_fn)
 
@@ -939,7 +902,7 @@ class HeadBatchStream:
     """Per-head batch stream with automatic file transitions and cycling."""
 
     def __init__(self, head_config, seed, epoch, batch_size, n_devices, mesh,
-                 max_nodes_per_batch=256):
+                 max_nodes_per_batch=256, max_edges_per_batch=None):
         self.head_idx = head_config["head_idx"]
         self.head_name = head_config["name"]
         self.all_files = _get_pkl_files(head_config["train_path"])
@@ -953,6 +916,7 @@ class HeadBatchStream:
         self.n_devices = n_devices
         self.mesh = mesh
         self.max_nodes_per_batch = max_nodes_per_batch
+        self.max_edges_per_batch = max_edges_per_batch
         self.cycle_count = 0
         self.file_idx = 0
         self.files_consumed = 0
@@ -990,6 +954,7 @@ class HeadBatchStream:
             dataset=dataset, batch_size=self.batch_size,
             n_buckets=8, shuffle=True, drop_last=True,
             rngs=rngs, max_nodes_per_batch=self.max_nodes_per_batch,
+            max_edges_per_batch=self.max_edges_per_batch,
         )
         loader = MultiDeviceDataLoader(
             base_loader=base_loader, n_devices=self.n_devices,
@@ -1388,11 +1353,11 @@ def _train_loop_multihead(
     stress_weight = config.get('stress_weight', 1.0)
     log_every = config.get('log_every', 50)
     max_nodes_per_batch = config.get('max_nodes_per_batch', 256)
+    max_edges_per_batch = config.get('max_edges_per_batch', None)
 
-    train_step = make_fused_multihead_train_step(
-        optimizer=optimizer, mesh=mesh, loss_fn=loss_fn,
-        num_heads=num_heads, num_head_configs=len(head_configs),
-        ema_decay=config.get('ema_decay', 0.99),
+    grad_step = make_per_head_grad_step(mesh, loss_fn, num_heads)
+    opt_step = make_multihead_optimizer_step(
+        optimizer, mesh, ema_decay=config.get('ema_decay', 0.99),
     )
 
     # Replicate per-head weights across devices
@@ -1416,6 +1381,7 @@ def _train_loop_multihead(
             hc["head_idx"]: HeadBatchStream(
                 hc, seed, epoch, config['batch_size'], n_devices, mesh,
                 max_nodes_per_batch=max_nodes_per_batch,
+                max_edges_per_batch=max_edges_per_batch,
             )
             for hc in head_configs
         }
@@ -1423,40 +1389,87 @@ def _train_loop_multihead(
 
         step_in_epoch = 0
         epoch_step_start = time.time()
+        is_multihost = jax.process_count() > 1
 
-        while not streams[longest_head].completed_first_pass:
-            step_in_epoch += 1
+        while True:
+            # Per-head sequential: load batch → grad → log → free, one head at a time
+            acc_grads = None
+            total_gw = 0.0
+            per_head_metrics_list = []
+            head_log_meta = []  # lightweight logging metadata (CPU-side only)
 
-            head_batches = []
-            head_batch_meta = []
-            for head_cfg in head_configs:
+            for i, head_cfg in enumerate(head_configs):
                 h = head_cfg["head_idx"]
                 stream = streams[h]
+                hw = head_weights[h]
+                g_w = float(head_cfg.get('grad_weight', 1.0))
+
+                # Load batch for this head only
                 batch, info = stream.next_batch()
-                head_batches.append(batch)
                 graph_indices = getattr(info, 'graph_indices_per_device', None)
-                head_batch_meta.append((head_cfg, stream, batch, graph_indices))
 
-            head_args = []
-            for i, head_cfg in enumerate(head_configs):
-                hw = head_weights[head_cfg["head_idx"]]
-                head_args.extend([
-                    head_batches[i],
-                    hw['energy_weight'], hw['force_weight'],
-                    hw['stress_weight'], hw['grad_weight'],
-                ])
-
-            params, opt_state, ema_params, step, metrics = train_step(
-                graphdef, params, opt_state, schedule_state,
-                ema_params, step, *head_args,
-            )
-
-            current_step = int(np.asarray(step))
-
-            for head_cfg, stream, batch, graph_indices in head_batch_meta:
+                # Extract logging metadata (CPU-side) before gradient computation
                 per_device_metadata = extract_per_device_batch_metadata(
                     batch, jax.local_device_count()
                 )
+                head_log_meta.append((
+                    head_cfg, stream, per_device_metadata, graph_indices,
+                ))
+
+                # Compute gradient for this head
+                grads, loss_i, aux_i, grad_norm_i = grad_step(
+                    graphdef, params, batch,
+                    hw['energy_weight'], hw['force_weight'], hw['stress_weight'],
+                )
+
+                # Free batch GPU memory (no longer needed)
+                del batch
+
+                # Accumulate weighted gradients
+                weighted = jax.tree.map(lambda g, _w=g_w: g * _w, grads)
+                del grads
+                if acc_grads is None:
+                    acc_grads = weighted
+                else:
+                    acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, weighted)
+                del weighted
+                total_gw += g_w
+
+                per_head_metrics_list.append({
+                    'loss': loss_i,
+                    'energy_loss': aux_i['energy_loss'],
+                    'force_loss': aux_i['force_loss'],
+                    'stress_loss': aux_i['stress_loss'],
+                    'grad_norm': grad_norm_i,
+                    'n_graphs': aux_i['n_graphs'],
+                    'n_atoms': aux_i['n_atoms'],
+                })
+
+            # Normalize accumulated gradients and apply optimizer
+            acc_grads = jax.tree.map(lambda g: g / total_gw, acc_grads)
+            combined_grad_norm = optax.global_norm(acc_grads)
+
+            params, opt_state, ema_params, step = opt_step(
+                params, opt_state, schedule_state, ema_params, step, acc_grads,
+            )
+
+            # Build metrics dict (compatible with existing logging code)
+            metrics = {
+                'combined_grad_norm': combined_grad_norm,
+                'per_head_loss': jnp.stack([m['loss'] for m in per_head_metrics_list]),
+                'per_head_energy_loss': jnp.stack([m['energy_loss'] for m in per_head_metrics_list]),
+                'per_head_force_loss': jnp.stack([m['force_loss'] for m in per_head_metrics_list]),
+                'per_head_stress_loss': jnp.stack([m['stress_loss'] for m in per_head_metrics_list]),
+                'per_head_grad_norm': jnp.stack([m['grad_norm'] for m in per_head_metrics_list]),
+                'per_head_n_graphs': jnp.stack([m['n_graphs'] for m in per_head_metrics_list]),
+                'per_head_n_atoms': jnp.stack([m['n_atoms'] for m in per_head_metrics_list]),
+            }
+
+            step_in_epoch += 1
+            current_step = int(np.asarray(step))
+
+            # Log batch info (uses pre-extracted CPU metadata, no GPU tensors)
+            for head_cfg, stream, per_device_metadata, graph_indices in head_log_meta:
                 batch_logger.log_batch(
                     epoch, 'train', Path(stream._current_file).name,
                     stream.batches_yielded, per_device_metadata,
@@ -1488,6 +1501,20 @@ def _train_loop_multihead(
 
             if current_step % 500 == 0 and current_step > 0:
                 sync_and_check(mesh, f"periodic_sync_{current_step}")
+
+            # Collective epoch-done check: all nodes must agree to stop
+            local_done = streams[longest_head].completed_first_pass
+            if is_multihost:
+                done_arr = multihost_utils.process_allgather(
+                    jnp.array([int(local_done)], dtype=jnp.int32),
+                    tiled=False,
+                )
+                # Stop when ANY node has finished (prevents desync)
+                if int(jax.device_get(done_arr).max()) > 0:
+                    break
+            else:
+                if local_done:
+                    break
 
         # Stream statistics
         for h, stream in streams.items():

@@ -73,9 +73,6 @@ echo "InfiniBand: ENABLED (mlx5_0,mlx5_4,mlx5_5,mlx5_8)"
 echo "=========================================="
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-if [ -f training_node3.log ]; then
-    mv training_node3.log training_node3.log.${TIMESTAMP}.bak
-fi
 
 echo "Starting training at $(date)"
 

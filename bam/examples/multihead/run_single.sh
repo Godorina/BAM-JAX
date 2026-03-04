@@ -52,7 +52,7 @@ fi
 # === Step 2: Build target pkl (fit E0 from data, supports multiple traj files) ===
 if [ ! -d "$TARGET_TRAIN_PATH" ]; then
     echo "Building target train pkl (fitting atom energies)..."
-    python -m bam.scripts.build_pkl_multi_input \
+    python -m bam.scripts.build_pkl_multihead \
         --input $TARGET_TRAIN_TRAJ \
         --output $TARGET_TRAIN_PATH \
         --prefix lpsc_train \
@@ -64,12 +64,12 @@ fi
 
 if [ ! -d "$TARGET_VALID_PATH" ]; then
     echo "Building target valid pkl (using fitted atom_energies_target.json)..."
-    python -m bam.scripts.build_pkl_multi_input \
+    python -m bam.scripts.build_pkl_multihead \
         --input $TARGET_VALID_TRAJ \
         --output $TARGET_VALID_PATH \
         --prefix lpsc_valid \
         --chunk-size 100000 \
-        --atom-energies atom_energies_target.json
+        --atom-energies atom_energies.json
 else
     echo "$TARGET_VALID_PATH already exists, skipping."
 fi

@@ -1,32 +1,62 @@
-"""Convert .traj/.xyz files to .pkl graph files for multihead training.
+"""Convert .traj/.xyz files to .pkl graph files for training.
 
-Supports both large files (OMat24, chunked reading) and small files.
-Uses bam.data.data_nnx.atoms_to_graph_with_targets() for graph construction.
+Unified script: replaces build_pkl.py and build_pkl_multi_input.py.
+- Single or multiple input files (--input file1.traj file2.traj ...)
+- Large file chunked reading (--chunk-size)
+- Non-periodic molecular data support (fix_cell_for_nonperiodic)
+- Per-element reference energy fitting (--fit-energies)
 
-For replay (OMat24): uses built-in ATOM_ENERGIES (no --fit-energies needed).
-For target (new dataset): use --fit-energies to compute per-element E0 from data.
+================================================================================
+Usage
+================================================================================
 
-Usage:
-    # OMat24 replay (built-in ATOM_ENERGIES)
-    python build_pkl_multihead.py \
-        --input data/omat24_sampled_10pct_train.traj \
+1) OMat24 replay (built-in ATOM_ENERGIES, no fitting needed):
+
+    python -m bam.scripts.build_pkl_multihead \
+        --input data/omat24_train.traj \
         --output data/omat24_train_pkl \
-        --prefix omat24_train \
+        --prefix replay_train \
         --chunk-size 100000
 
-    # Target train (fit E0 from data, saves atom_energies.json)
-    python build_pkl_multihead.py \
-        --input /path/to/target_train.traj \
-        --output data/lpsc_train_pkl \
-        --prefix lpsc_train \
+2) Single dataset training (fit E0 from data, saves atom_energies.json):
+
+    python -m bam.scripts.build_pkl_multihead \
+        --input data/train.traj \
+        --output data/train_pkl \
+        --prefix train \
         --fit-energies
 
-    # Target valid (use fitted E0)
-    python build_pkl_multihead.py \
-        --input /path/to/target_valid.traj \
-        --output data/lpsc_valid_pkl \
-        --prefix lpsc_valid \
+3) Multiple files combined (fit E0 from all files):
+
+    python -m bam.scripts.build_pkl_multihead \
+        --input mptrj_train.traj salex_train.traj \
+        --output data/combined_train_pkl \
+        --prefix combined_train \
+        --fit-energies \
+        --chunk-size 100000
+
+4) Validation/test set (use fitted E0 from training step):
+
+    python -m bam.scripts.build_pkl_multihead \
+        --input data/valid.traj \
+        --output data/valid_pkl \
+        --prefix valid \
         --atom-energies atom_energies.json
+
+================================================================================
+Arguments
+================================================================================
+
+    --input          One or more .traj/.xyz input files (required)
+    --output         Output directory for .pkl files (required)
+    --prefix         Prefix for .pkl filenames (required)
+    --cutoff         Neighbor list cutoff radius (default: 6.0)
+    --graphs-per-file  Max graphs per .pkl file (default: 50000)
+    --chunk-size     Read in chunks of this size; 0 = read all at once (default: 0)
+    --fit-energies   Fit per-element E0 via least-squares and save to atom_energies.json
+    --atom-energies  Path to atom_energies.json from a previous --fit-energies run
+
+================================================================================
 """
 
 import argparse
@@ -107,7 +137,7 @@ def get_enr_avg_per_element(traj, element):
 
 
 def build_pkl(
-    input_path: str,
+    input_paths,
     output_dir: str,
     prefix: str,
     cutoff: float = 6.0,
@@ -116,10 +146,12 @@ def build_pkl(
     atom_energies: np.ndarray = None,
     atom_indices: dict = None,
 ):
-    """Convert trajectory/xyz to pkl files.
+    """Convert trajectory/xyz file(s) to pkl files.
+
+    Processes multiple input files sequentially, with continuous pkl numbering.
 
     Args:
-        input_path: Path to .traj or .xyz file.
+        input_paths: Path (str) or list of paths to .traj or .xyz files.
         output_dir: Directory to write pkl files.
         prefix: Prefix for pkl filenames (e.g., 'omat24_train').
         cutoff: Neighbor list cutoff radius.
@@ -133,6 +165,10 @@ def build_pkl(
         atom_energies = ATOM_ENERGIES
     if atom_indices is None:
         atom_indices = ATOMIC_NUMBER_TO_INDEX
+
+    # Normalize to list
+    if isinstance(input_paths, str):
+        input_paths = [input_paths]
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -149,17 +185,48 @@ def build_pkl(
             pickle.dump(graphs, f)
         return ipkl + 1
 
-    if chunk_size > 0:
-        # Chunked reading for large files
-        start = 0
-        while True:
-            end = start + chunk_size
-            print(f"\nReading frames {start}:{end} ...")
-            atoms_list = ase.io.read(input_path, index=f'{start}:{end}')
-            if len(atoms_list) == 0:
-                break
+    for file_i, input_path in enumerate(input_paths):
+        print(f"\n--- File {file_i+1}/{len(input_paths)}: {input_path} ---")
 
-            for atoms in tqdm(atoms_list, desc=f"Chunk {start}-{start+len(atoms_list)}"):
+        if chunk_size > 0:
+            # Chunked reading for large files
+            start = 0
+            while True:
+                end = start + chunk_size
+                print(f"\nReading frames {start}:{end} ...")
+                atoms_list = ase.io.read(input_path, index=f'{start}:{end}')
+                if len(atoms_list) == 0:
+                    break
+
+                for atoms in tqdm(atoms_list, desc=f"Chunk {start}-{start+len(atoms_list)}"):
+                    atoms = fix_cell_for_nonperiodic(atoms, cutoff)
+                    g = atoms_to_graph_with_targets(
+                        atoms, cutoff=cutoff,
+                        atom_energies=atom_energies, atom_indices=atom_indices,
+                    )
+                    if g is not None:
+                        graphs.append(g)
+                    else:
+                        skipped += 1
+                    total_processed += 1
+
+                    if len(graphs) >= graphs_per_file:
+                        ipkl = save_graphs(graphs, ipkl)
+                        graphs = []
+                        gc.collect()
+
+                if len(atoms_list) < chunk_size:
+                    break
+                start = end
+                del atoms_list
+                gc.collect()
+        else:
+            # Read entire file at once (small files)
+            print(f"Reading {input_path} ...")
+            atoms_list = ase.io.read(input_path, index=':')
+            print(f"Read {len(atoms_list)} frames")
+
+            for atoms in tqdm(atoms_list, desc="Converting"):
                 atoms = fix_cell_for_nonperiodic(atoms, cutoff)
                 g = atoms_to_graph_with_targets(
                     atoms, cutoff=cutoff,
@@ -176,35 +243,13 @@ def build_pkl(
                     graphs = []
                     gc.collect()
 
-            if len(atoms_list) < chunk_size:
-                break
-            start = end
-            del atoms_list
-            gc.collect()
-    else:
-        # Read entire file at once (small files)
-        print(f"Reading {input_path} ...")
-        atoms_list = ase.io.read(input_path, index=':')
-        print(f"Read {len(atoms_list)} frames")
-
-        for atoms in tqdm(atoms_list, desc="Converting"):
-            atoms = fix_cell_for_nonperiodic(atoms, cutoff)
-            g = atoms_to_graph_with_targets(
-                atoms, cutoff=cutoff,
-                atom_energies=atom_energies, atom_indices=atom_indices,
-            )
-            if g is not None:
-                graphs.append(g)
-            else:
-                skipped += 1
-            total_processed += 1
-
     # Save remaining graphs
     if len(graphs) > 0:
         ipkl = save_graphs(graphs, ipkl)
 
     print(f"\n{'='*50}")
     print(f"Completed!")
+    print(f"Input files: {len(input_paths)}")
     print(f"Total processed: {total_processed}")
     print(f"Total skipped: {skipped}")
     print(f"Total pkl files: {ipkl}")
@@ -213,12 +258,18 @@ def build_pkl(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert .traj/.xyz to .pkl for multihead training")
-    parser.add_argument("--input", required=True, help="Input trajectory/xyz file")
-    parser.add_argument("--output", required=True, help="Output directory for pkl files")
-    parser.add_argument("--prefix", required=True, help="Prefix for pkl filenames")
-    parser.add_argument("--cutoff", type=float, default=6.0, help="Neighbor list cutoff (default: 6.0)")
-    parser.add_argument("--graphs-per-file", type=int, default=50000, help="Max graphs per pkl file (default: 50000)")
+    parser = argparse.ArgumentParser(
+        description="Convert .traj/.xyz to .pkl for training (single/multi-input supported)")
+    parser.add_argument("--input", nargs='+', required=True,
+                        help="Input trajectory/xyz file(s)")
+    parser.add_argument("--output", required=True,
+                        help="Output directory for pkl files")
+    parser.add_argument("--prefix", required=True,
+                        help="Prefix for pkl filenames")
+    parser.add_argument("--cutoff", type=float, default=6.0,
+                        help="Neighbor list cutoff (default: 6.0)")
+    parser.add_argument("--graphs-per-file", type=int, default=50000,
+                        help="Max graphs per pkl file (default: 50000)")
     parser.add_argument("--chunk-size", type=int, default=0,
                         help="Read file in chunks of this size (0=read all at once, default: 0)")
     parser.add_argument("--fit-energies", action="store_true",
@@ -243,21 +294,96 @@ if __name__ == "__main__":
         print(f"  Loaded {len(atom_energies)} species energies")
 
     elif args.fit_energies:
-        # Fit atom energies from the input trajectory
-        print("Fitting per-element reference energies from input data...")
-        print(f"Reading {args.input} for fitting...")
-        all_atoms = ase.io.read(args.input, index=':')
-        print(f"  Read {len(all_atoms)} frames")
+        # Fit atom energies from ALL input files combined (chunked reading for memory efficiency)
+        fit_chunk = args.chunk_size if args.chunk_size > 0 else 100000
+        print(f"Fitting per-element reference energies from input data (chunk_size={fit_chunk})...")
 
-        # Find unique elements
-        unique_z = sorted(set(z for atoms in all_atoms for z in atoms.get_atomic_numbers()))
-        print(f"  Found {len(unique_z)} elements: {[int(z) for z in unique_z]}")
+        if len(args.input) == 1 and args.chunk_size == 0:
+            # Single small file: use simple path (read all at once + get_enr_avg_per_element)
+            print(f"Reading {args.input[0]} for fitting...")
+            all_atoms = ase.io.read(args.input[0], index=':')
+            print(f"  Read {len(all_atoms)} frames")
 
-        # Fit using get_enr_avg_per_element
-        enr_avg_per_element, uniq_element = get_enr_avg_per_element(all_atoms, unique_z)
+            unique_z = sorted(set(z for atoms in all_atoms for z in atoms.get_atomic_numbers()))
+            print(f"  Found {len(unique_z)} elements: {[int(z) for z in unique_z]}")
 
-        atom_indices = uniq_element  # {atomic_number: index}
-        atom_energies = np.array([enr_avg_per_element[i] for i in range(len(unique_z))])
+            enr_avg_per_element, uniq_element = get_enr_avg_per_element(all_atoms, unique_z)
+
+            atom_indices = uniq_element
+            atom_energies = np.array([enr_avg_per_element[i] for i in range(len(unique_z))])
+
+            del all_atoms
+            gc.collect()
+        else:
+            # Multiple files or large file: chunked fitting
+            all_energies = []
+            all_element_counts = []  # list of {Z: count} per structure
+            unique_z_set = set()
+            total_frames = 0
+
+            for inp in args.input:
+                print(f"Reading {inp} for fitting...")
+                start = 0
+                file_frames = 0
+                while True:
+                    end = start + fit_chunk
+                    atoms_list = ase.io.read(inp, index=f'{start}:{end}')
+                    if len(atoms_list) == 0:
+                        break
+
+                    for atoms in tqdm(atoms_list, desc=f"Fitting {start}-{start+len(atoms_list)}"):
+                        all_energies.append(atoms.get_potential_energy())
+                        nums = atoms.get_atomic_numbers()
+                        unique_z_set.update(nums)
+                        counts = {}
+                        for z in nums:
+                            counts[int(z)] = counts.get(int(z), 0) + 1
+                        all_element_counts.append(counts)
+
+                    file_frames += len(atoms_list)
+                    if len(atoms_list) < fit_chunk:
+                        break
+                    start = end
+                    del atoms_list
+                    gc.collect()
+
+                print(f"  Read {file_frames} frames")
+                total_frames += file_frames
+
+            print(f"  Total frames for fitting: {total_frames}")
+
+            # Build arrays for fitting
+            unique_z = sorted(unique_z_set)
+            print(f"  Found {len(unique_z)} elements: {[int(z) for z in unique_z]}")
+
+            uniq_element = {int(e): i for i, e in enumerate(unique_z)}
+            tgt_enr = np.array(all_energies)
+            c0 = np.zeros((len(unique_z), len(all_energies)))
+            for j, counts in enumerate(all_element_counts):
+                for z, cnt in counts.items():
+                    c0[uniq_element[z], j] = cnt
+
+            del all_energies, all_element_counts
+            gc.collect()
+
+            # Fit
+            m0 = tgt_enr.sum() / c0.sum()
+            w0 = np.array([m0 for _ in unique_z])
+
+            def loss_fn(weight, count):
+                prd_enr = np.einsum('i,ij->j', weight, count)
+                diff = (tgt_enr - prd_enr)
+                return (diff * diff).mean()
+
+            results = minimize(loss_fn, x0=w0, args=(c0,), method='BFGS')
+            print(f"  Fitting converged: {results.success}, residual MSE: {results.fun:.6e}")
+
+            enr_avg_per_element = {i: results.x[i] for i in range(len(unique_z))}
+            atom_indices = uniq_element
+            atom_energies = np.array([enr_avg_per_element[i] for i in range(len(unique_z))])
+
+            del tgt_enr, c0
+            gc.collect()
 
         # Print fitted values
         from ase.data import chemical_symbols
@@ -269,7 +395,7 @@ if __name__ == "__main__":
         save_path = "atom_energies.json"
         ae_data = {
             "atom_energies": atom_energies.tolist(),
-            "atomic_numbers": [int(z) for z in unique_z],
+            "atomic_numbers": [int(z) for z in sorted(atom_indices.keys())],
             "atomic_number_to_index": {str(z): i for z, i in atom_indices.items()},
         }
         with open(save_path, "w") as f:
@@ -277,14 +403,11 @@ if __name__ == "__main__":
         print(f"\n  Saved to {save_path}")
         print(f"  Use --atom-energies {save_path} for validation/test sets")
 
-        del all_atoms
-        gc.collect()
-
     else:
         print("Using built-in ATOM_ENERGIES (OMat24)")
 
     build_pkl(
-        input_path=args.input,
+        input_paths=args.input,
         output_dir=args.output,
         prefix=args.prefix,
         cutoff=args.cutoff,

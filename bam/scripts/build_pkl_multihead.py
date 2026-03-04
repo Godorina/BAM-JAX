@@ -274,7 +274,10 @@ if __name__ == "__main__":
                         help="Read file in chunks of this size (0=read all at once, default: 0)")
     parser.add_argument("--fit-energies", action="store_true",
                         help="Fit per-element reference energies from the input data "
-                             "(saves to atom_energies.json)")
+                             "(saves to atom_energies.json by default)")
+    parser.add_argument("--output-energies", type=str, default="atom_energies.json",
+                        help="Output filename for fitted atom energies "
+                             "(default: atom_energies.json)")
     parser.add_argument("--atom-energies", type=str, default=None,
                         help="Path to atom_energies.json (from a previous --fit-energies run). "
                              "Use this for validation/test sets to ensure consistency.")
@@ -392,7 +395,7 @@ if __name__ == "__main__":
             print(f"    {chemical_symbols[z]:>2s} (Z={z:3d}): {atom_energies[idx]:.6f} eV")
 
         # Save to JSON
-        save_path = "atom_energies.json"
+        save_path = args.output_energies
         ae_data = {
             "atom_energies": atom_energies.tolist(),
             "atomic_numbers": [int(z) for z in sorted(atom_indices.keys())],

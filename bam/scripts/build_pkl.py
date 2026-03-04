@@ -45,6 +45,27 @@ from bam.data.atom_energies import ATOM_ENERGIES, ATOMIC_NUMBER_TO_INDEX
 from bam.data.data_nnx import atoms_to_graph_with_targets
 
 
+def fix_cell_for_nonperiodic(atoms, cutoff):
+    """Set a bounding-box cell for non-periodic systems so matscipy can compute neighbor lists."""
+    if not any(atoms.pbc):
+        # Save calculator results before modifying positions
+        energy = atoms.calc.results.get('energy') if atoms.calc else None
+        forces = atoms.calc.results.get('forces') if atoms.calc else None
+
+        pos = atoms.positions
+        max_range = np.ptp(pos, axis=0).max()
+        L = max_range + 2 * cutoff + 2.0
+        atoms.cell = [L, L, L]
+        atoms.center()
+
+        # Restore calculator after center() invalidates it
+        if energy is not None or forces is not None:
+            from ase.calculators.singlepoint import SinglePointCalculator
+            calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
+            atoms.calc = calc
+    return atoms
+
+
 def get_enr_avg_per_element(traj, element):
     """Fit per-element reference energies from dataset via least-squares.
 
@@ -140,6 +161,7 @@ def build_pkl(
                 break
 
             for atoms in tqdm(atoms_list, desc=f"Chunk {start}-{start+len(atoms_list)}"):
+                atoms = fix_cell_for_nonperiodic(atoms, cutoff)
                 g = atoms_to_graph_with_targets(
                     atoms, cutoff=cutoff,
                     atom_energies=atom_energies, atom_indices=atom_indices,
@@ -167,6 +189,7 @@ def build_pkl(
         print(f"Read {len(atoms_list)} frames")
 
         for atoms in tqdm(atoms_list, desc="Converting"):
+            atoms = fix_cell_for_nonperiodic(atoms, cutoff)
             g = atoms_to_graph_with_targets(
                 atoms, cutoff=cutoff,
                 atom_energies=atom_energies, atom_indices=atom_indices,

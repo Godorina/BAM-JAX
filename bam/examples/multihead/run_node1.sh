@@ -111,7 +111,8 @@ if [ ! -d "$TARGET_TRAIN_PATH" ]; then
         --output $TARGET_TRAIN_PATH \
         --prefix lpsc_train \
         --chunk-size 100000 \
-        --fit-energies
+        --fit-energies \
+        --output-energies atom_energies_target.json
 else
     echo "$TARGET_TRAIN_PATH already exists, skipping."
 fi
@@ -123,7 +124,7 @@ if [ ! -d "$TARGET_VALID_PATH" ]; then
         --output $TARGET_VALID_PATH \
         --prefix lpsc_valid \
         --chunk-size 100000 \
-        --atom-energies atom_energies.json
+        --atom-energies atom_energies_target.json
 else
     echo "$TARGET_VALID_PATH already exists, skipping."
 fi

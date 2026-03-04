@@ -594,26 +594,53 @@ def make_per_head_grad_step(mesh, loss_fn, num_heads):
     return jax.jit(sharded_fn)
 
 
-def make_multihead_optimizer_step(optimizer, mesh, ema_decay=0.99):
-    """Create a sharded optimizer update step that takes pre-computed gradients.
+def make_accumulate_and_update_step(optimizer, mesh, num_head_configs, ema_decay=0.99):
+    """Accumulate per-head gradients and apply optimizer, all inside shard_map.
 
-    Grads are already pmean'd from per-head steps, so no collective needed here.
+    Takes pre-computed per-head grads (already pmean'd) and their grad_weights,
+    accumulates them with weighting, normalizes, and applies the optimizer update.
+    All operations stay inside shard_map to avoid multi-host sharding issues.
+
+    Args: fixed = (graphdef_unused, params, opt_state, schedule_state, ema_params, step)
+          per_head = (grads_0, grad_weight_0, grads_1, grad_weight_1, ...)
+    Returns: (new_params, new_opt_state, new_ema_params, new_step, combined_grad_norm)
     """
+    N = num_head_configs
 
-    def per_device_opt(params, opt_state, schedule_state, ema_params, step, grads):
-        updates, new_opt = optimizer.update(grads, opt_state, params)
+    def per_device_fn(params, opt_state, schedule_state, ema_params, step,
+                      *grad_and_weight_args):
+        acc = None
+        total_w = jnp.float32(0.0)
+        for i in range(N):
+            grads_i = grad_and_weight_args[i * 2]
+            w_i = grad_and_weight_args[i * 2 + 1]
+            weighted = jax.tree.map(lambda g: g * w_i, grads_i)
+            if acc is None:
+                acc = weighted
+            else:
+                acc = jax.tree.map(lambda a, g: a + g, acc, weighted)
+            total_w = total_w + w_i
+
+        acc = jax.tree.map(lambda g: g / total_w, acc)
+        combined_norm = optax.global_norm(acc)
+
+        updates, new_opt = optimizer.update(acc, opt_state, params)
         updates = optax.tree_utils.tree_scale(schedule_state.scale, updates)
         new_p = optax.apply_updates(params, updates)
         new_ema = jax.tree.map(
             lambda ema, p: ema_decay * ema + (1 - ema_decay) * p,
             ema_params, new_p,
         )
-        return new_p, new_opt, new_ema, step + 1
+        return new_p, new_opt, new_ema, step + 1, combined_norm
+
+    fixed_specs = (P(), P(), P(), P(), P())
+    # Each head contributes (grads=P(), grad_weight=P())
+    per_head_specs = tuple(P() for _ in range(N * 2))
 
     sharded_fn = shard_map(
-        per_device_opt, mesh=mesh,
-        in_specs=(P(), P(), P(), P(), P(), P()),
-        out_specs=(P(), P(), P(), P()),
+        per_device_fn, mesh=mesh,
+        in_specs=fixed_specs + per_head_specs,
+        out_specs=(P(), P(), P(), P(), P()),
     )
     return jax.jit(sharded_fn)
 
@@ -801,40 +828,72 @@ def evaluate_per_head(
             'n_graphs': 0.0, 'n_atoms': 0.0,
         }
 
-        for fname in valid_files:
+        n_valid_files = len(valid_files)
+        if jax.process_index() == 0:
+            print(f"  [eval] head={head_name}: {n_valid_files} valid files",
+                  flush=True)
+
+        for fi, fname in enumerate(valid_files):
             file_name = Path(fname).name
             if batch_logger is not None:
                 batch_logger.reset_counters()
+
+            # --- Diagnostic: step 1 - load data ---
+            _diag_t0 = time.time()
+            print(f"  [P{jax.process_index()}] eval {head_name} file {fi+1}/{n_valid_files} "
+                  f"({file_name}) step1: loading...", flush=True)
 
             dataset = DatasetWithHead(
                 file_path=fname, head_idx=head_idx,
                 process_id=jax.process_index(),
                 n_processes=jax.process_count(),
             )
+            print(f"  [P{jax.process_index()}] eval {head_name} step1 done: "
+                  f"{len(dataset)} graphs in {time.time()-_diag_t0:.1f}s", flush=True)
+
             if batch_logger is not None:
                 batch_logger.set_total_graphs(len(dataset) * jax.process_count())
 
+            # --- Diagnostic: step 2 - create loader & count actual batches ---
+            _diag_t1 = time.time()
             base_loader = BucketedDataLoader(
                 dataset=dataset, batch_size=batch_size, n_buckets=8,
                 shuffle=False, drop_last=False, rngs=nnx.Rngs(0),
             )
+            # Count ACTUAL base batches (len(base_loader) is inaccurate when
+            # max_nodes/edges_per_batch causes batches to split or graphs to skip)
+            actual_base_count = sum(1 for _ in base_loader)
+            # base_loader will be reset when MultiDeviceDataLoader calls iter()
             loader = MultiDeviceDataLoader(
                 base_loader=base_loader, n_devices=n_devices,
                 mesh=mesh, drop_incomplete=False,
             )
+            actual_n = actual_base_count // max(jax.local_device_count(), 1)
+            total_batches = actual_n
+            print(f"  [P{jax.process_index()}] eval {head_name} step2 done: "
+                  f"{total_batches} batches (base={actual_base_count}, "
+                  f"theoretical={len(base_loader)}) "
+                  f"in {time.time()-_diag_t1:.1f}s", flush=True)
 
-            # Sync batch count across hosts
+            # --- Diagnostic: step 3 - sync using ACTUAL batch counts ---
             if jax.process_count() > 1:
-                local_n = len(base_loader) // jax.local_device_count()
-                local_arr = jnp.array([local_n], dtype=jnp.int32)
+                local_arr = jnp.array([actual_n], dtype=jnp.int32)
+                print(f"  [P{jax.process_index()}] eval {head_name} step3: "
+                      f"allgather (actual_n={actual_n})...", flush=True)
                 all_counts = multihost_utils.process_allgather(local_arr, tiled=False)
                 all_counts = jax.device_get(all_counts).flatten().tolist()
                 synced_max = min(all_counts)
+                print(f"  [P{jax.process_index()}] eval {head_name} step3: "
+                      f"sync_global_devices (synced_max={synced_max})...", flush=True)
                 multihost_utils.sync_global_devices(
                     f"eval_head_{head_name}_file_{file_name}")
+                print(f"  [P{jax.process_index()}] eval {head_name} step3 done",
+                      flush=True)
             else:
                 synced_max = float('inf')
 
+            # --- Diagnostic: step 4 - batch processing ---
+            eval_start_time = time.time()
             batch_idx = 0
             for batch, info in loader:
                 if batch_idx >= synced_max:
@@ -844,6 +903,17 @@ def evaluate_per_head(
                 metrics = eval_step(graphdef, params_replicated, batch)
                 for k in totals:
                     totals[k] += float(metrics[k])
+
+                if batch_idx % 100 == 0:
+                    print(f"  [P{jax.process_index()}] eval {head_name} "
+                          f"batch {batch_idx}/{total_batches} "
+                          f"({time.time()-eval_start_time:.1f}s)", flush=True)
+
+            if jax.process_index() == 0:
+                elapsed = time.time() - eval_start_time
+                print(f"  [eval] head={head_name} file {fi+1}/{n_valid_files} "
+                      f"({file_name}): {batch_idx} batches in {elapsed:.1f}s",
+                      flush=True)
 
                 if batch_logger is not None:
                     per_device_metadata = extract_per_device_batch_metadata(
@@ -876,6 +946,17 @@ def evaluate_per_head(
         all_head_metrics[head_name] = head_metrics
         total_val_loss += head_loss * n_g
         total_weight += n_g
+
+        # --- Barrier after head evaluation: all nodes must finish this head
+        #     before any node starts evaluating the next head ---
+        if jax.process_count() > 1:
+            if jax.process_index() == 0:
+                print(f"  [eval] head={head_name} done, syncing all nodes...",
+                      flush=True)
+            multihost_utils.sync_global_devices(
+                f"eval_head_{head_name}_complete")
+            if jax.process_index() == 0:
+                print(f"  [eval] head={head_name} sync complete", flush=True)
 
     total_val_loss = total_val_loss / max(total_weight, 1)
     return all_head_metrics, total_val_loss
@@ -1352,12 +1433,14 @@ def _train_loop_multihead(
     force_weight = config.get('force_weight', 1.0)
     stress_weight = config.get('stress_weight', 1.0)
     log_every = config.get('log_every', 50)
+    val_every_steps = config.get('val_every_steps', 0)  # 0 = epoch-end only
     max_nodes_per_batch = config.get('max_nodes_per_batch', 256)
     max_edges_per_batch = config.get('max_edges_per_batch', None)
 
     grad_step = make_per_head_grad_step(mesh, loss_fn, num_heads)
-    opt_step = make_multihead_optimizer_step(
-        optimizer, mesh, ema_decay=config.get('ema_decay', 0.99),
+    accumulate_and_update = make_accumulate_and_update_step(
+        optimizer, mesh, num_head_configs=len(head_configs),
+        ema_decay=config.get('ema_decay', 0.99),
     )
 
     # Replicate per-head weights across devices
@@ -1366,6 +1449,7 @@ def _train_loop_multihead(
                            for k, v in head_weights[h].items()}
 
     best_state = None
+    last_val_step = int(jax.device_get(unreplicate(step)))  # skip eval already done before restart
     emergency_ckpt = get_emergency_checkpointer(
         save_path=str(ckpt_dir / 'ckpt_emergency.pkl'))
 
@@ -1391,18 +1475,18 @@ def _train_loop_multihead(
         epoch_step_start = time.time()
         is_multihost = jax.process_count() > 1
 
+        is_first_step = True
         while True:
-            # Per-head sequential: load batch → grad → log → free, one head at a time
-            acc_grads = None
-            total_gw = 0.0
+            # Per-head sequential: load batch → grad → free, one head at a time
+            per_head_grads = []
             per_head_metrics_list = []
-            head_log_meta = []  # lightweight logging metadata (CPU-side only)
+            head_log_meta = []
+            step_start_time = time.time()
 
             for i, head_cfg in enumerate(head_configs):
                 h = head_cfg["head_idx"]
                 stream = streams[h]
                 hw = head_weights[h]
-                g_w = float(head_cfg.get('grad_weight', 1.0))
 
                 # Load batch for this head only
                 batch, info = stream.next_batch()
@@ -1416,24 +1500,25 @@ def _train_loop_multihead(
                     head_cfg, stream, per_device_metadata, graph_indices,
                 ))
 
-                # Compute gradient for this head
+                # Compute gradient for this head (separate JIT → frees activations)
+                if is_first_step and jax.process_index() == 0:
+                    print(f"  [JIT] grad_step head={head_cfg['name']} compiling...",
+                          flush=True)
+                    t0 = time.time()
+
                 grads, loss_i, aux_i, grad_norm_i = grad_step(
                     graphdef, params, batch,
                     hw['energy_weight'], hw['force_weight'], hw['stress_weight'],
                 )
 
-                # Free batch GPU memory (no longer needed)
+                if is_first_step and jax.process_index() == 0:
+                    print(f"  [JIT] grad_step head={head_cfg['name']} done "
+                          f"in {time.time() - t0:.1f}s", flush=True)
+
                 del batch
 
-                # Accumulate weighted gradients
-                weighted = jax.tree.map(lambda g, _w=g_w: g * _w, grads)
+                per_head_grads.append(grads)
                 del grads
-                if acc_grads is None:
-                    acc_grads = weighted
-                else:
-                    acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, weighted)
-                del weighted
-                total_gw += g_w
 
                 per_head_metrics_list.append({
                     'loss': loss_i,
@@ -1445,13 +1530,30 @@ def _train_loop_multihead(
                     'n_atoms': aux_i['n_atoms'],
                 })
 
-            # Normalize accumulated gradients and apply optimizer
-            acc_grads = jax.tree.map(lambda g: g / total_gw, acc_grads)
-            combined_grad_norm = optax.global_norm(acc_grads)
+            # Accumulate grads + optimizer update inside shard_map (no host-side ops)
+            grad_and_weight_args = []
+            for i, head_cfg in enumerate(head_configs):
+                grad_and_weight_args.append(per_head_grads[i])
+                grad_and_weight_args.append(head_weights[head_cfg["head_idx"]]['grad_weight'])
+            del per_head_grads
 
-            params, opt_state, ema_params, step = opt_step(
-                params, opt_state, schedule_state, ema_params, step, acc_grads,
-            )
+            if is_first_step and jax.process_index() == 0:
+                print(f"  [JIT] accumulate_and_update compiling...", flush=True)
+                t0 = time.time()
+
+            params, opt_state, ema_params, step, combined_grad_norm = \
+                accumulate_and_update(
+                    params, opt_state, schedule_state, ema_params, step,
+                    *grad_and_weight_args,
+                )
+            del grad_and_weight_args
+
+            if is_first_step and jax.process_index() == 0:
+                print(f"  [JIT] accumulate_and_update done in {time.time() - t0:.1f}s",
+                      flush=True)
+                print(f"  [JIT] First step total: {time.time() - step_start_time:.1f}s",
+                      flush=True)
+                is_first_step = False
 
             # Build metrics dict (compatible with existing logging code)
             metrics = {
@@ -1501,6 +1603,101 @@ def _train_loop_multihead(
 
             if current_step % 500 == 0 and current_step > 0:
                 sync_and_check(mesh, f"periodic_sync_{current_step}")
+
+            # Mid-epoch validation every val_every_steps
+            if (val_every_steps > 0 and current_step > 0 and
+                    current_step - last_val_step >= val_every_steps):
+                last_val_step = current_step
+                print(f"\n--- Mid-epoch validation at step {current_step} ---",
+                      file=fout)
+
+                # Save latest checkpoint
+                mid_unrep_params = unreplicate_pytree(params)
+                mid_unrep_params = multihost_utils.broadcast_one_to_all(
+                    mid_unrep_params)
+                mid_unrep_ema = unreplicate_pytree(ema_params)
+                mid_unrep_ema = multihost_utils.broadcast_one_to_all(
+                    mid_unrep_ema)
+                mid_unrep_schedule = unreplicate_pytree(schedule_state)
+                mid_unrep_schedule = multihost_utils.broadcast_one_to_all(
+                    mid_unrep_schedule)
+                latest_state = {
+                    'params': mid_unrep_params,
+                    'ema_params': mid_unrep_ema,
+                    'opt_state': unreplicate_pytree(opt_state),
+                    'schedule_state': mid_unrep_schedule,
+                    'step': current_step,
+                    'best_val_loss': best_val_loss,
+                    'epoch': epoch, 'step_in_epoch': step_in_epoch,
+                    'num_heads': num_heads,
+                    'head_configs': head_configs,
+                    'foundation_ckpt': config.get('foundation_ckpt'),
+                }
+                save_checkpoint_safe(latest_state,
+                                     str(ckpt_dir / 'ckpt_latest.pkl'))
+
+                # Run validation
+                sync_and_check(mesh, f"pre_midval_step_{current_step}")
+                val_start = time.time()
+
+                mid_per_head_metrics, mid_val_loss = evaluate_per_head(
+                    graphdef=graphdef, params=mid_unrep_ema,
+                    head_configs=head_configs, batch_size=config['batch_size'],
+                    n_devices=n_devices, mesh=mesh,
+                    energy_weight=energy_weight, force_weight=force_weight,
+                    stress_weight=stress_weight, loss_fn=loss_fn,
+                    num_heads=num_heads, batch_logger=batch_logger,
+                    epoch=epoch,
+                )
+                val_time = time.time() - val_start
+
+                if jax.process_count() > 1:
+                    mid_val_loss = float(multihost_utils.broadcast_one_to_all(
+                        jnp.array(mid_val_loss)))
+
+                print(f"  Validation ({val_time:.1f}s) | "
+                      f"Total Loss: {mid_val_loss:.6f}", file=fout)
+                for hname, hmetrics in mid_per_head_metrics.items():
+                    print(f"    [{hname}] Loss: {hmetrics['total_loss']:.6f} | "
+                          f"E_MAE: {hmetrics['energy_mae']:.6f} | "
+                          f"F_MAE: {hmetrics['force_mae']:.6f} | "
+                          f"S_MAE: {hmetrics['stress_mae']:.6f}", file=fout)
+
+                # Update LR schedule
+                _, new_schedule = schedule.update(
+                    updates=mid_unrep_params, state=mid_unrep_schedule,
+                    value=mid_val_loss)
+                new_schedule = multihost_utils.broadcast_one_to_all(
+                    new_schedule)
+                schedule_state = replicate_pytree(new_schedule, mesh)
+
+                # Save best checkpoint
+                if mid_val_loss < best_val_loss:
+                    improvement = best_val_loss - mid_val_loss
+                    best_val_loss = mid_val_loss
+                    best_state = {
+                        'params': mid_unrep_params,
+                        'ema_params': mid_unrep_ema,
+                        'opt_state': unreplicate_pytree(opt_state),
+                        'schedule_state': new_schedule,
+                        'step': current_step,
+                        'epoch': epoch,
+                        'best_val_loss': best_val_loss,
+                        'metrics': mid_per_head_metrics,
+                        'num_heads': num_heads,
+                        'head_configs': head_configs,
+                        'foundation_ckpt': config.get('foundation_ckpt'),
+                    }
+                    print(f"  *** New best: {best_val_loss:.6f} "
+                          f"(+{improvement:.6f}) ***", file=fout)
+                    save_checkpoint_safe(best_state,
+                                         str(ckpt_dir / 'ckpt_best.pkl'))
+                else:
+                    print(f"  No improvement (best: {best_val_loss:.6f})",
+                          file=fout)
+
+                print(f"--- End mid-epoch validation ---\n", file=fout)
+                del mid_unrep_params, mid_unrep_ema, mid_unrep_schedule
 
             # Collective epoch-done check: all nodes must agree to stop
             local_done = streams[longest_head].completed_first_pass

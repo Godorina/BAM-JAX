@@ -556,10 +556,18 @@ def stack_batches_for_devices(
     max_edges = max(edge_sizes)
     max_graphs = max(graph_sizes)
 
-    # Multi-host: allgather to sync max sizes across all hosts.
+    # Determine if mesh spans multiple hosts or is local-only.
+    # A local mesh (e.g. for eval) has the same device count as local devices.
+    mesh_size = len(mesh.devices.flat)
+    local_devices = jax.local_devices()
+    n_local = len(local_devices)
+    is_multihost_mesh = mesh_size > n_local
+
+    # Multi-host global mesh: allgather to sync max sizes across all hosts.
     # Without this, different hosts pad to different sizes
     # → different JIT compilations → pmean collective ID mismatch → deadlock.
-    if jax.process_count() > 1:
+    # Skip for local mesh (no cross-host communication needed).
+    if is_multihost_mesh:
         from jax.experimental import multihost_utils
         local_maxes = jnp.array([max_nodes, max_edges, max_graphs], dtype=jnp.int32)
         global_maxes = multihost_utils.process_allgather(local_maxes, tiled=False)
@@ -578,13 +586,9 @@ def stack_batches_for_devices(
     # Stack along device dimension
     stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *padded_batches)
 
-    # For multi-host: each host only puts data on its LOCAL devices
+    # For multi-host global mesh: each host only puts data on its LOCAL devices
     # Then combine into a global sharded array
-    n_hosts = jax.process_count()
-    local_devices = jax.local_devices()
-    n_local = len(local_devices)
-
-    if n_hosts > 1:
+    if is_multihost_mesh:
         # Multi-host: use make_array_from_single_device_arrays
         sharding = NamedSharding(mesh, P('dp'))
 
@@ -598,14 +602,14 @@ def stack_batches_for_devices(
             ]
             # Create global array from local device arrays
             # Global shape: (n_total_devices, ...)
-            global_shape = (jax.device_count(),) + arr.shape[1:]
+            global_shape = (mesh_size,) + arr.shape[1:]
             return jax.make_array_from_single_device_arrays(
                 global_shape, sharding, local_arrays
             )
 
         sharded = jax.tree.map(shard_for_multihost, stacked)
     else:
-        # Single-host: use simple device_put
+        # Single-host or local mesh: use simple device_put
         sharding = NamedSharding(mesh, P('dp'))
         sharded = jax.tree.map(lambda x: jax.device_put(x, sharding), stacked)
 

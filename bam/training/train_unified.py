@@ -39,6 +39,7 @@ import optax
 import jraph
 import pickle
 import time
+import gc
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -801,10 +802,33 @@ def evaluate_per_head(
     graphdef, params, head_configs, batch_size, n_devices, mesh,
     energy_weight, force_weight, stress_weight, loss_fn, num_heads,
     batch_logger=None, epoch=0,
+    eval_local_mesh=None, eval_step_fn=None,
 ) -> Tuple[Dict, float]:
-    """Evaluate multihead model on each head's validation set separately."""
-    params_replicated = replicate_pytree(params, mesh)
-    eval_step = make_sharded_evaluate_step(mesh, loss_fn)
+    """Evaluate multihead model on each head's validation set separately.
+
+    Uses a LOCAL mesh (per-host devices only) so that eval_step's psum
+    communicates only within each host's GPUs.  This eliminates cross-host
+    collective operations during the batch loop, preventing deadlocks when
+    hosts have different numbers of batches.  Metrics are gathered across
+    hosts once per head after all files are processed.
+    """
+    # --- Local mesh: reuse pre-built or create on first call ---
+    if eval_local_mesh is None or eval_step_fn is None:
+        local_devices = jax.local_devices()
+        n_local = len(local_devices)
+        eval_local_mesh = Mesh(np.array(local_devices), ('dp',))
+        eval_step_fn = make_sharded_evaluate_step(eval_local_mesh, loss_fn)
+    else:
+        n_local = len(eval_local_mesh.devices.flat)
+
+    local_mesh = eval_local_mesh
+    eval_step = eval_step_fn
+
+    params_replicated = replicate_pytree(params, local_mesh)
+
+    if jax.process_index() == 0:
+        print(f"  [eval] using local mesh ({n_local} devices per host, "
+              f"no cross-host sync during batches)", flush=True)
 
     all_head_metrics = {}
     total_val_loss = 0.0
@@ -838,74 +862,46 @@ def evaluate_per_head(
             if batch_logger is not None:
                 batch_logger.reset_counters()
 
-            # --- Diagnostic: step 1 - load data ---
+            # --- step 1: load data ---
             _diag_t0 = time.time()
-            print(f"  [P{jax.process_index()}] eval {head_name} file {fi+1}/{n_valid_files} "
-                  f"({file_name}) step1: loading...", flush=True)
-
             dataset = DatasetWithHead(
                 file_path=fname, head_idx=head_idx,
                 process_id=jax.process_index(),
                 n_processes=jax.process_count(),
             )
-            print(f"  [P{jax.process_index()}] eval {head_name} step1 done: "
-                  f"{len(dataset)} graphs in {time.time()-_diag_t0:.1f}s", flush=True)
 
             if batch_logger is not None:
                 batch_logger.set_total_graphs(len(dataset) * jax.process_count())
 
-            # --- Diagnostic: step 2 - create loader & count actual batches ---
-            _diag_t1 = time.time()
+            # --- step 2: create loader (LOCAL mesh, no cross-host sync) ---
             base_loader = BucketedDataLoader(
                 dataset=dataset, batch_size=batch_size, n_buckets=8,
                 shuffle=False, drop_last=False, rngs=nnx.Rngs(0),
             )
-            # Count ACTUAL base batches (len(base_loader) is inaccurate when
-            # max_nodes/edges_per_batch causes batches to split or graphs to skip)
-            actual_base_count = sum(1 for _ in base_loader)
-            # base_loader will be reset when MultiDeviceDataLoader calls iter()
             loader = MultiDeviceDataLoader(
-                base_loader=base_loader, n_devices=n_devices,
-                mesh=mesh, drop_incomplete=False,
+                base_loader=base_loader, n_devices=n_local,
+                mesh=local_mesh, drop_incomplete=False,
             )
-            actual_n = actual_base_count // max(jax.local_device_count(), 1)
-            total_batches = actual_n
-            print(f"  [P{jax.process_index()}] eval {head_name} step2 done: "
-                  f"{total_batches} batches (base={actual_base_count}, "
-                  f"theoretical={len(base_loader)}) "
-                  f"in {time.time()-_diag_t1:.1f}s", flush=True)
+            total_batches = len(base_loader) // max(n_local, 1)
 
-            # --- Diagnostic: step 3 - sync using ACTUAL batch counts ---
-            if jax.process_count() > 1:
-                local_arr = jnp.array([actual_n], dtype=jnp.int32)
-                print(f"  [P{jax.process_index()}] eval {head_name} step3: "
-                      f"allgather (actual_n={actual_n})...", flush=True)
-                all_counts = multihost_utils.process_allgather(local_arr, tiled=False)
-                all_counts = jax.device_get(all_counts).flatten().tolist()
-                synced_max = min(all_counts)
-                print(f"  [P{jax.process_index()}] eval {head_name} step3: "
-                      f"sync_global_devices (synced_max={synced_max})...", flush=True)
-                multihost_utils.sync_global_devices(
-                    f"eval_head_{head_name}_file_{file_name}")
-                print(f"  [P{jax.process_index()}] eval {head_name} step3 done",
-                      flush=True)
-            else:
-                synced_max = float('inf')
+            if jax.process_index() == 0:
+                print(f"  [eval] head={head_name} file {fi+1}/{n_valid_files} "
+                      f"({file_name}): {len(dataset)} graphs, "
+                      f"~{total_batches} batches, "
+                      f"loaded in {time.time()-_diag_t0:.1f}s", flush=True)
 
-            # --- Diagnostic: step 4 - batch processing ---
+            # --- step 3: process batches (LOCAL psum only) ---
             eval_start_time = time.time()
             batch_idx = 0
             for batch, info in loader:
-                if batch_idx >= synced_max:
-                    break
                 batch_idx += 1
                 graph_indices = getattr(info, 'graph_indices_per_device', None)
                 metrics = eval_step(graphdef, params_replicated, batch)
                 for k in totals:
                     totals[k] += float(metrics[k])
 
-                if batch_idx % 100 == 0:
-                    print(f"  [P{jax.process_index()}] eval {head_name} "
+                if batch_idx % 100 == 0 and jax.process_index() == 0:
+                    print(f"  [eval] head={head_name} "
                           f"batch {batch_idx}/{total_batches} "
                           f"({time.time()-eval_start_time:.1f}s)", flush=True)
 
@@ -917,7 +913,7 @@ def evaluate_per_head(
 
                 if batch_logger is not None:
                     per_device_metadata = extract_per_device_batch_metadata(
-                        batch, jax.local_device_count()
+                        batch, n_local
                     )
                     batch_logger.log_batch(
                         epoch=epoch, mode='valid', file_name=file_name,
@@ -925,6 +921,21 @@ def evaluate_per_head(
                         head_name=head_name,
                         graph_indices_per_device=graph_indices,
                     )
+
+        # --- Gather metrics across all hosts (one sync per head) ---
+        if jax.process_count() > 1:
+            if jax.process_index() == 0:
+                print(f"  [eval] head={head_name} gathering metrics "
+                      f"across {jax.process_count()} hosts...", flush=True)
+            for k in totals:
+                local_val = jnp.array([totals[k]], dtype=jnp.float32)
+                all_vals = multihost_utils.process_allgather(
+                    local_val, tiled=False)
+                totals[k] = float(jnp.sum(all_vals))
+            multihost_utils.sync_global_devices(
+                f"eval_head_{head_name}_complete")
+            if jax.process_index() == 0:
+                print(f"  [eval] head={head_name} sync complete", flush=True)
 
         n_g = max(totals['n_graphs'], 1)
         n_a = max(totals['n_atoms'], 1)
@@ -947,16 +958,9 @@ def evaluate_per_head(
         total_val_loss += head_loss * n_g
         total_weight += n_g
 
-        # --- Barrier after head evaluation: all nodes must finish this head
-        #     before any node starts evaluating the next head ---
-        if jax.process_count() > 1:
-            if jax.process_index() == 0:
-                print(f"  [eval] head={head_name} done, syncing all nodes...",
-                      flush=True)
-            multihost_utils.sync_global_devices(
-                f"eval_head_{head_name}_complete")
-            if jax.process_index() == 0:
-                print(f"  [eval] head={head_name} sync complete", flush=True)
+    # --- Free replicated params to reclaim GPU memory before training resumes ---
+    del params_replicated
+    gc.collect()
 
     total_val_loss = total_val_loss / max(total_weight, 1)
     return all_head_metrics, total_val_loss
@@ -1443,6 +1447,13 @@ def _train_loop_multihead(
         ema_decay=config.get('ema_decay', 0.99),
     )
 
+    # Pre-build eval resources (local mesh + JIT-compiled eval_step)
+    # so that evaluate_per_head does NOT recompile every call.
+    local_devices = jax.local_devices()
+    n_local = len(local_devices)
+    eval_local_mesh = Mesh(np.array(local_devices), ('dp',))
+    eval_step_fn = make_sharded_evaluate_step(eval_local_mesh, loss_fn)
+
     # Replicate per-head weights across devices
     for h in head_weights:
         head_weights[h] = {k: replicate(v, mesh)
@@ -1648,6 +1659,8 @@ def _train_loop_multihead(
                     stress_weight=stress_weight, loss_fn=loss_fn,
                     num_heads=num_heads, batch_logger=batch_logger,
                     epoch=epoch,
+                    eval_local_mesh=eval_local_mesh,
+                    eval_step_fn=eval_step_fn,
                 )
                 val_time = time.time() - val_start
 
@@ -1733,6 +1746,8 @@ def _train_loop_multihead(
             energy_weight=energy_weight, force_weight=force_weight,
             stress_weight=stress_weight, loss_fn=loss_fn,
             num_heads=num_heads, batch_logger=batch_logger, epoch=epoch,
+            eval_local_mesh=eval_local_mesh,
+            eval_step_fn=eval_step_fn,
         )
         val_time = time.time() - val_start
 

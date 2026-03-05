@@ -20,6 +20,13 @@ os.environ.setdefault('JAX_COORDINATION_SERVICE_CONNECT_TIMEOUT', '600')
 os.environ.setdefault('JAX_COORDINATION_SERVICE_HEARTBEAT_INTERVAL', '30')
 os.environ.setdefault('JAX_COORDINATION_SERVICE_SHUTDOWN_TIMEOUT', '120')
 
+# Disable XLA CUDA command buffers to prevent OOM from accumulated CUDA graphs.
+# Each unique input shape creates a new CUDA graph; with bucketed batching this
+# leads to thousands of graphs consuming GPU memory.
+xla_flags = os.environ.get('XLA_FLAGS', '')
+if '--xla_gpu_enable_command_buffer=' not in xla_flags:
+    os.environ['XLA_FLAGS'] = xla_flags + ' --xla_gpu_enable_command_buffer='
+
 # =============================================================================
 # Imports
 # =============================================================================
@@ -1352,6 +1359,9 @@ def _train_loop_singlehead(
                     'step': int(np.asarray(step)),
                     'best_val_loss': best_val_loss,
                     'epoch': epoch, 'ipkl': ipkl,
+                    'atom_energies': config['atom_energies'],
+                    'atom_energies_path': config.get('atom_energies_path'),
+                    'atomic_number_to_index': config.get('atomic_number_to_index'),
                 }
                 save_checkpoint_safe(latest_state, str(ckpt_dir / 'ckpt_latest.pkl'))
 
@@ -1403,6 +1413,9 @@ def _train_loop_singlehead(
                         'best_val_loss': best_val_loss,
                         'metrics': val_metrics,
                         'epoch': epoch, 'ipkl': ipkl,
+                        'atom_energies': config['atom_energies'],
+                        'atom_energies_path': config.get('atom_energies_path'),
+                        'atomic_number_to_index': config.get('atomic_number_to_index'),
                     }
                     print(f"  *** New best: {best_val_loss:.6f} "
                           f"(+{improvement:.6f}) ***", file=fout)
@@ -1643,6 +1656,9 @@ def _train_loop_multihead(
                     'num_heads': num_heads,
                     'head_configs': head_configs,
                     'foundation_ckpt': config.get('foundation_ckpt'),
+                    'atom_energies': config['atom_energies'],
+                    'atom_energies_path': config.get('atom_energies_path'),
+                    'atomic_number_to_index': config.get('atomic_number_to_index'),
                 }
                 save_checkpoint_safe(latest_state,
                                      str(ckpt_dir / 'ckpt_latest.pkl'))
@@ -1700,6 +1716,9 @@ def _train_loop_multihead(
                         'num_heads': num_heads,
                         'head_configs': head_configs,
                         'foundation_ckpt': config.get('foundation_ckpt'),
+                        'atom_energies': config['atom_energies'],
+                        'atom_energies_path': config.get('atom_energies_path'),
+                        'atomic_number_to_index': config.get('atomic_number_to_index'),
                     }
                     print(f"  *** New best: {best_val_loss:.6f} "
                           f"(+{improvement:.6f}) ***", file=fout)
@@ -1788,6 +1807,9 @@ def _train_loop_multihead(
                 'num_heads': num_heads,
                 'head_configs': head_configs,
                 'foundation_ckpt': config.get('foundation_ckpt'),
+                'atom_energies': config['atom_energies'],
+                'atom_energies_path': config.get('atom_energies_path'),
+                'atomic_number_to_index': config.get('atomic_number_to_index'),
             }
             print(f"  *** New best: {best_val_loss:.6f} "
                   f"(+{improvement:.6f}) ***", file=fout)
@@ -2020,7 +2042,7 @@ def train_unified(config: Dict):
 
 if __name__ == "__main__":
     import json
-    from bam.data.atom_energies import ATOM_ENERGIES
+    from bam.data.atom_energies import ATOM_ENERGIES, ATOMIC_NUMBER_TO_INDEX
 
     # Initialize distributed runtime FIRST
     try:
@@ -2057,12 +2079,20 @@ if __name__ == "__main__":
             ae_data = json.load(f)
         if isinstance(ae_data, dict):
             config['atom_energies'] = ae_data['atom_energies']
+            if 'atomic_number_to_index' in ae_data:
+                config['atomic_number_to_index'] = {
+                    int(k): v for k, v in ae_data['atomic_number_to_index'].items()
+                }
+            else:
+                config['atomic_number_to_index'] = dict(ATOMIC_NUMBER_TO_INDEX)
         else:
             config['atom_energies'] = ae_data
+            config['atomic_number_to_index'] = dict(ATOMIC_NUMBER_TO_INDEX)
     else:
         if jax.process_index() == 0:
             print("Using built-in ATOM_ENERGIES")
         config['atom_energies'] = ATOM_ENERGIES.tolist()
+        config['atomic_number_to_index'] = dict(ATOMIC_NUMBER_TO_INDEX)
 
     mode_str = "Multihead" if config.get('multihead', False) else "Single-head"
     if jax.process_index() == 0:

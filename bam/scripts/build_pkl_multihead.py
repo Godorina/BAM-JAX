@@ -63,6 +63,7 @@ import argparse
 import gc
 import json
 import pickle
+import sys
 from pathlib import Path
 
 import ase.io
@@ -281,13 +282,35 @@ if __name__ == "__main__":
     parser.add_argument("--atom-energies", type=str, default=None,
                         help="Path to atom_energies.json (from a previous --fit-energies run). "
                              "Use this for validation/test sets to ensure consistency.")
+    parser.add_argument("--atom-energies-from-ckpt", type=str, default=None,
+                        help="Path to a checkpoint .pkl that contains atom_energies "
+                             "(e.g., foundation model checkpoint). "
+                             "Use this for replay data building.")
     args = parser.parse_args()
 
     # Determine atom energies and index mapping
+    # Priority: --atom-energies-from-ckpt > --atom-energies > --fit-energies > built-in
     atom_energies = ATOM_ENERGIES
     atom_indices = ATOMIC_NUMBER_TO_INDEX
 
-    if args.atom_energies:
+    if args.atom_energies_from_ckpt:
+        # Load atom energies from a training checkpoint (e.g., foundation model)
+        print(f"Loading atom energies from checkpoint: {args.atom_energies_from_ckpt}")
+        with open(args.atom_energies_from_ckpt, 'rb') as f:
+            ckpt = pickle.load(f)
+        if 'atom_energies' not in ckpt:
+            print("ERROR: Checkpoint does not contain atom_energies. "
+                  "Re-train with updated code to save atom_energies in checkpoint.")
+            sys.exit(1)
+        atom_energies = np.array(ckpt['atom_energies'])
+        atom_indices = ckpt.get('atomic_number_to_index', ATOMIC_NUMBER_TO_INDEX)
+        if isinstance(atom_indices, list):
+            atom_indices = {int(k): v for k, v in enumerate(atom_indices)}
+        print(f"  Loaded {len(atom_energies)} species energies from checkpoint")
+        del ckpt
+        gc.collect()
+
+    elif args.atom_energies:
         # Load pre-computed atom energies (e.g., from training set fitting)
         print(f"Loading atom energies from {args.atom_energies}")
         with open(args.atom_energies) as f:

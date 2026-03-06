@@ -13,6 +13,7 @@
     "learning_rate": 0.0005,
     "batch_size": 4,
     "n_epochs": 100,
+    "val_every_steps": 5000,
     "energy_weight": 1.0,
     "force_weight": 100.0,
     "stress_weight": 1.0,

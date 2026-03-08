@@ -52,6 +52,7 @@ from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 import signal
+import shutil
 import sys
 import traceback
 import threading
@@ -1653,6 +1654,7 @@ def _train_loop_multihead(
                     'step': current_step,
                     'best_val_loss': best_val_loss,
                     'epoch': epoch, 'step_in_epoch': step_in_epoch,
+                    'epoch_completed': False,
                     'num_heads': num_heads,
                     'head_configs': head_configs,
                     'foundation_ckpt': config.get('foundation_ckpt'),
@@ -1818,6 +1820,26 @@ def _train_loop_multihead(
         else:
             print(f"  No improvement (best: {best_val_loss:.6f})", file=fout)
 
+        # Save latest checkpoint at epoch end with epoch_completed flag
+        epoch_end_state = {
+            'params': unrep_params,
+            'ema_params': unrep_ema,
+            'opt_state': unreplicate_pytree(opt_state),
+            'schedule_state': new_schedule,
+            'step': int(np.asarray(step)),
+            'best_val_loss': best_val_loss,
+            'epoch': epoch,
+            'epoch_completed': True,
+            'num_heads': num_heads,
+            'head_configs': head_configs,
+            'foundation_ckpt': config.get('foundation_ckpt'),
+            'atom_energies': config['atom_energies'],
+            'atom_energies_path': config.get('atom_energies_path'),
+            'atomic_number_to_index': config.get('atomic_number_to_index'),
+        }
+        save_checkpoint_safe(epoch_end_state,
+                             str(ckpt_dir / 'ckpt_latest.pkl'))
+
         epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch+1}/{config['n_epochs']} completed in "
               f"{epoch_time:.1f}s\n", file=fout)
@@ -1936,8 +1958,13 @@ def train_unified(config: Dict):
         ckpt_data = None
 
         if jax.process_index() == 0:
-            for ckpt_name in ['ckpt_latest.pkl', 'ckpt_best.pkl',
-                              'ckpt_multihead_best.pkl']:
+            if config.get('reset_best_loss', False):
+                ckpt_order = ['ckpt_best.pkl', 'ckpt_latest.pkl',
+                              'ckpt_multihead_best.pkl']
+            else:
+                ckpt_order = ['ckpt_latest.pkl', 'ckpt_best.pkl',
+                              'ckpt_multihead_best.pkl']
+            for ckpt_name in ckpt_order:
                 ckpt_path = ckpt_dir / ckpt_name
                 if ckpt_path.exists():
                     ckpt_data = load_checkpoint(str(ckpt_path))
@@ -1994,10 +2021,34 @@ def train_unified(config: Dict):
                     start_epoch += 1
                     start_ipkl = 0
             else:
-                start_epoch = ckpt_epoch + 1
+                # If epoch was completed, start next epoch;
+                # otherwise restart the same epoch from the beginning
+                epoch_completed = ckpt_data.get('epoch_completed', False) if jax.process_index() == 0 else False
+                if jax.process_count() > 1:
+                    epoch_completed = bool(int(multihost_utils.broadcast_one_to_all(
+                        jnp.array(1 if epoch_completed else 0))))
+                if epoch_completed:
+                    start_epoch = ckpt_epoch + 1
+                else:
+                    start_epoch = ckpt_epoch
+                    print(f"Epoch {ckpt_epoch+1} was incomplete, restarting from beginning of epoch",
+                          file=fout)
 
             print(f"Resumed from step {ckpt_step} (epoch {start_epoch})",
                   file=fout)
+
+            # Reset best_val_loss when loss weights change across restarts
+            if config.get('reset_best_loss', False):
+                if jax.process_index() == 0:
+                    best_ckpt = ckpt_dir / 'ckpt_best.pkl'
+                    if best_ckpt.exists():
+                        backup_path = ckpt_dir / 'ckpt_best_backup.pkl'
+                        shutil.copy2(str(best_ckpt), str(backup_path))
+                        print(f"Backed up {best_ckpt} -> {backup_path}",
+                              file=fout)
+                best_val_loss = float('inf')
+                print(f"Reset best_val_loss to inf (reset_best_loss=true)",
+                      file=fout)
 
     # Dispatch to training loop
     if is_multihead:

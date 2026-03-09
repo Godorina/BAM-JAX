@@ -811,6 +811,7 @@ def evaluate_per_head(
     energy_weight, force_weight, stress_weight, loss_fn, num_heads,
     batch_logger=None, epoch=0,
     eval_local_mesh=None, eval_step_fn=None,
+    head_weights=None,
 ) -> Tuple[Dict, float]:
     """Evaluate multihead model on each head's validation set separately.
 
@@ -947,10 +948,20 @@ def evaluate_per_head(
 
         n_g = max(totals['n_graphs'], 1)
         n_a = max(totals['n_atoms'], 1)
+        # Use per-head weights if available, otherwise fall back to global
+        if head_weights is not None and head_idx in head_weights:
+            hw = head_weights[head_idx]
+            h_ew = float(hw['energy_weight'])
+            h_fw = float(hw['force_weight'])
+            h_sw = float(hw['stress_weight'])
+        else:
+            h_ew = energy_weight
+            h_fw = force_weight
+            h_sw = stress_weight
         head_loss = (
-            energy_weight * totals['energy_loss'] / n_g
-            + force_weight * totals['force_loss'] / (3 * n_a)
-            + stress_weight * totals['stress_loss'] / n_g
+            h_ew * totals['energy_loss'] / n_g
+            + h_fw * totals['force_loss'] / (3 * n_a)
+            + h_sw * totals['stress_loss'] / n_g
         )
         head_metrics = {
             'energy_mae': totals['energy_ae'] / n_g,
@@ -1679,6 +1690,7 @@ def _train_loop_multihead(
                     epoch=epoch,
                     eval_local_mesh=eval_local_mesh,
                     eval_step_fn=eval_step_fn,
+                    head_weights=head_weights,
                 )
                 val_time = time.time() - val_start
 
@@ -1769,6 +1781,7 @@ def _train_loop_multihead(
             num_heads=num_heads, batch_logger=batch_logger, epoch=epoch,
             eval_local_mesh=eval_local_mesh,
             eval_step_fn=eval_step_fn,
+            head_weights=head_weights,
         )
         val_time = time.time() - val_start
 

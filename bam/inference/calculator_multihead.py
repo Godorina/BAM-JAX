@@ -112,19 +112,40 @@ class RACEMultiheadCalculator(Calculator):
         self._predict_fn(self.params, graph)
         print(f"done in {time.time() - t0:.1f}s")
 
+    def _detect_n_species(self):
+        """Detect n_species from checkpoint weight shapes."""
+        import jax
+        for path, leaf in jax.tree_util.tree_leaves_with_path(self.params):
+            path_str = '/'.join(
+                str(getattr(p, 'key', getattr(p, 'idx', p))) for p in path
+            )
+            if 'species_embedding' in path_str:
+                return leaf.shape[0]
+        return None
+
     def _setup_model(self):
         """Setup multihead model architecture from config."""
         config = self.config
 
+        # Detect n_species from weights (most reliable)
+        n_species = self._detect_n_species()
+        if n_species is not None:
+            print(f"Detected n_species={n_species} from checkpoint weights")
+        else:
+            n_species = 89
+            print(f"Could not detect n_species, using default {n_species}")
+
         if self.atom_energies is None:
-            try:
-                from bam.data.atom_energies import ATOM_ENERGIES
-                self.atom_energies = ATOM_ENERGIES
-            except ImportError:
-                self.atom_energies = np.zeros(120)
+            self.atom_energies = np.zeros(n_species)
+
+        if len(self.atom_energies) != n_species:
+            print(f"Padding atom_energies from {len(self.atom_energies)} to {n_species}")
+            padded = np.zeros(n_species)
+            padded[:min(len(self.atom_energies), n_species)] = self.atom_energies[:n_species]
+            self.atom_energies = padded
 
         model = RACEMultihead(
-            n_species=len(self.atom_energies),
+            n_species=n_species,
             num_heads=self.num_heads,
             lmax=config.get('lmax', 3),
             hidden_irreps=config.get('hidden_irreps', "128x0e + 128x1o + 128x2e"),

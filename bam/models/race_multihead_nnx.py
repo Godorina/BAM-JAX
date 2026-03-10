@@ -167,6 +167,7 @@ class RACEMultihead(nnx.Module):
         )
 
         # Multihead readout irreps
+        readout_hidden_irreps = hidden_irreps.filter(keep="0e")
         multihead_out = e3nn.Irreps(f"{num_heads}x0e")
 
         layers = []
@@ -192,7 +193,7 @@ class RACEMultihead(nnx.Module):
 
             # x_readout with multihead output
             x_readout = RACEXReadout(
-                hidden_irreps=e3nn.Irreps("64x0e"),
+                hidden_irreps=readout_hidden_irreps,
                 output_irreps=multihead_out,
                 x_irreps=x_irreps,
                 n_species=n_species,
@@ -203,7 +204,7 @@ class RACEMultihead(nnx.Module):
 
             # f_readout with multihead output
             f_readout = RACEXReadout(
-                hidden_irreps=e3nn.Irreps("64x0e"),
+                hidden_irreps=readout_hidden_irreps,
                 output_irreps=multihead_out,
                 x_irreps=input_irreps if i == 0 else hidden_irreps,
                 n_species=n_species,
@@ -270,7 +271,7 @@ class RACEMultihead(nnx.Module):
             cutoff_per_edge = jnp.full((num_edges,), self.cutoff)
 
         cutoff_per_edge = jnp.where(cutoff_per_edge > 1.0, cutoff_per_edge, 1.0)
-        cutoff_per_edge = cutoff_per_edge.squeeze()
+        cutoff_per_edge = cutoff_per_edge.reshape(-1)
 
         square_r_norm = jnp.sum(r**2, axis=-1)
         r_norm = jnp.where(square_r_norm == 0.0, 0.0, jnp.sqrt(square_r_norm))
@@ -349,6 +350,12 @@ class RACEMultihead(nnx.Module):
         )
         head_idx = data.globals["head"][node_graph]  # (n_atoms,)
 
+        # Compute padding mask before grad so it's applied inside
+        if n_graphs > 1:
+            node_mask = jraph.get_node_padding_mask(data)[:, None]
+        else:
+            node_mask = jnp.ones((sum_n_node, 1))
+
         if self.periodic:
             def total_energy_fn(
                 positions: jax.Array, cell: jax.Array, cutoff: jax.Array
@@ -356,7 +363,8 @@ class RACEMultihead(nnx.Module):
                 node_energies = self.node_energies(
                     positions, cell, cutoff, data, head_idx
                 )
-                return jnp.sum(node_energies), node_energies
+                ne = jnp.where(node_mask, node_energies, 0.0)
+                return jnp.sum(ne), ne
 
             grad_fn = jax.grad(total_energy_fn, argnums=(0, 1), has_aux=True)
             (grad, cellgrad), node_energies = grad_fn(
@@ -371,7 +379,8 @@ class RACEMultihead(nnx.Module):
                 node_energies = self.node_energies(
                     positions, None, None, data, head_idx
                 )
-                return jnp.sum(node_energies), node_energies
+                ne = jnp.where(node_mask, node_energies, 0.0)
+                return jnp.sum(ne), ne
 
             grad_fn = jax.grad(total_energy_fn, has_aux=True)
             grad, node_energies = grad_fn(data.nodes["positions"])
@@ -380,11 +389,6 @@ class RACEMultihead(nnx.Module):
             node_energies = node_energies + jax.lax.stop_gradient(
                 self.atom_energies[...][data.nodes["species"], None]
             )
-
-        if n_graphs > 1:
-            node_mask = jraph.get_node_padding_mask(data)[:, None]
-            grad = jnp.where(node_mask, grad, 0.0)
-            node_energies = jnp.where(node_mask, node_energies, 0.0)
 
         grad = jnp.where(jnp.isnan(grad), 0.0, grad)
 

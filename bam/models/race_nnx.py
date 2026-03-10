@@ -468,13 +468,20 @@ class RACE(nnx.Module):
         """
         n_graphs = data.n_node.shape[0]
 
+        # Compute padding mask before grad so it's applied inside
+        if n_graphs > 1:
+            node_mask = jraph.get_node_padding_mask(data)[:, None]
+        else:
+            node_mask = jnp.ones((data.nodes['positions'].shape[0], 1))
+
         if self.periodic:
             # --- Periodic: differentiate w.r.t. positions AND cell ---
             def total_energy_fn(positions: jax.Array,
                                 cell: jax.Array,
                                 cutoff: jax.Array) -> tuple[jax.Array, jax.Array]:
                 node_energies = self.node_energies(positions, cell, cutoff, data)
-                return jnp.sum(node_energies), node_energies
+                ne = jnp.where(node_mask, node_energies, 0.0)
+                return jnp.sum(ne), ne
 
             grad_fn = jax.grad(total_energy_fn, argnums=(0,1), has_aux=True)
             (grad, cellgrad), node_energies = \
@@ -485,7 +492,8 @@ class RACE(nnx.Module):
             # --- Molecular: differentiate w.r.t. positions only ---
             def total_energy_fn(positions: jax.Array) -> tuple[jax.Array, jax.Array]:
                 node_energies = self.node_energies(positions, None, None, data)
-                return jnp.sum(node_energies), node_energies
+                ne = jnp.where(node_mask, node_energies, 0.0)
+                return jnp.sum(ne), ne
 
             grad_fn = jax.grad(total_energy_fn, has_aux=True)
             grad, node_energies = grad_fn(data.nodes["positions"])
@@ -495,16 +503,6 @@ class RACE(nnx.Module):
             node_energies = node_energies + jax.lax.stop_gradient(
                 self.atom_energies[...][data.nodes["species"], None]
             )
-
-        # Get node mask for padded graphs
-        # jraph.get_node_padding_mask treats the last graph as padding,
-        # so for single graphs or non-padded batches, we need special handling
-        if n_graphs > 1:
-            # For padded batches, use jraph's mask (last graph is padding)
-            node_mask = jraph.get_node_padding_mask(data)[:, None]
-            grad = jnp.where(node_mask, grad, 0.0)
-            node_energies = jnp.where(node_mask, node_energies, 0.0)
-        # For single graphs, no masking needed (all nodes are valid)
 
         # Handle any NaN forces from numerical issues
         grad = jnp.where(jnp.isnan(grad), 0.0, grad)

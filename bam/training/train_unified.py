@@ -1374,6 +1374,7 @@ def _train_loop_singlehead(
                     'atom_energies': config['atom_energies'],
                     'atom_energies_path': config.get('atom_energies_path'),
                     'atomic_number_to_index': config.get('atomic_number_to_index'),
+                    'config': config,
                 }
                 save_checkpoint_safe(latest_state, str(ckpt_dir / 'ckpt_latest.pkl'))
 
@@ -1428,6 +1429,7 @@ def _train_loop_singlehead(
                         'atom_energies': config['atom_energies'],
                         'atom_energies_path': config.get('atom_energies_path'),
                         'atomic_number_to_index': config.get('atomic_number_to_index'),
+                    'config': config,
                     }
                     print(f"  *** New best: {best_val_loss:.6f} "
                           f"(+{improvement:.6f}) ***", file=fout)
@@ -1672,6 +1674,7 @@ def _train_loop_multihead(
                     'atom_energies': config['atom_energies'],
                     'atom_energies_path': config.get('atom_energies_path'),
                     'atomic_number_to_index': config.get('atomic_number_to_index'),
+                    'config': config,
                 }
                 save_checkpoint_safe(latest_state,
                                      str(ckpt_dir / 'ckpt_latest.pkl'))
@@ -1733,6 +1736,7 @@ def _train_loop_multihead(
                         'atom_energies': config['atom_energies'],
                         'atom_energies_path': config.get('atom_energies_path'),
                         'atomic_number_to_index': config.get('atomic_number_to_index'),
+                        'config': config,
                     }
                     print(f"  *** New best: {best_val_loss:.6f} "
                           f"(+{improvement:.6f}) ***", file=fout)
@@ -1825,6 +1829,7 @@ def _train_loop_multihead(
                 'atom_energies': config['atom_energies'],
                 'atom_energies_path': config.get('atom_energies_path'),
                 'atomic_number_to_index': config.get('atomic_number_to_index'),
+                'config': config,
             }
             print(f"  *** New best: {best_val_loss:.6f} "
                   f"(+{improvement:.6f}) ***", file=fout)
@@ -1849,6 +1854,7 @@ def _train_loop_multihead(
             'atom_energies': config['atom_energies'],
             'atom_energies_path': config.get('atom_energies_path'),
             'atomic_number_to_index': config.get('atomic_number_to_index'),
+            'config': config,
         }
         save_checkpoint_safe(epoch_end_state,
                              str(ckpt_dir / 'ckpt_latest.pkl'))

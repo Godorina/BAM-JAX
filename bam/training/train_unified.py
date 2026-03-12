@@ -683,6 +683,9 @@ def make_sharded_evaluate_step(mesh: Mesh, loss_fn: Callable):
             'energy_ae': jnp.sum(jnp.abs(energy_diff) * graph_mask),
             'force_ae': jnp.sum(jnp.abs(forces_diff) * node_mask[:, None]),
             'stress_ae': jnp.sum(jnp.abs(stress_diff) * graph_mask[:, None]),
+            'energy_se': jnp.sum(energy_diff ** 2 * graph_mask),
+            'force_se': jnp.sum(forces_diff ** 2 * node_mask[:, None]),
+            'stress_se': jnp.sum(stress_diff ** 2 * graph_mask[:, None]),
             'n_graphs': graph_mask.sum(),
             'n_atoms': node_mask.sum(),
         }
@@ -713,6 +716,7 @@ def evaluate_sharded(
     totals = {
         'energy_loss': 0.0, 'force_loss': 0.0, 'stress_loss': 0.0,
         'energy_ae': 0.0, 'force_ae': 0.0, 'stress_ae': 0.0,
+        'energy_se': 0.0, 'force_se': 0.0, 'stress_se': 0.0,
         'n_graphs': 0.0, 'n_atoms': 0.0,
     }
 
@@ -797,6 +801,9 @@ def evaluate_sharded(
         'energy_mae': totals['energy_ae'] / n_g,
         'force_mae': totals['force_ae'] / (3 * n_a),
         'stress_mae': totals['stress_ae'] / n_g,
+        'energy_rmse': np.sqrt(totals['energy_se'] / n_g),
+        'force_rmse': np.sqrt(totals['force_se'] / (3 * n_a)),
+        'stress_rmse': np.sqrt(totals['stress_se'] / n_g),
         'energy_loss': totals['energy_loss'] / n_g,
         'force_loss': totals['force_loss'] / (3 * n_a),
         'stress_loss': totals['stress_loss'] / n_g,
@@ -858,6 +865,7 @@ def evaluate_per_head(
         totals = {
             'energy_loss': 0.0, 'force_loss': 0.0, 'stress_loss': 0.0,
             'energy_ae': 0.0, 'force_ae': 0.0, 'stress_ae': 0.0,
+            'energy_se': 0.0, 'force_se': 0.0, 'stress_se': 0.0,
             'n_graphs': 0.0, 'n_atoms': 0.0,
         }
 
@@ -967,6 +975,9 @@ def evaluate_per_head(
             'energy_mae': totals['energy_ae'] / n_g,
             'force_mae': totals['force_ae'] / (3 * n_a),
             'stress_mae': totals['stress_ae'] / n_g,
+            'energy_rmse': np.sqrt(totals['energy_se'] / n_g),
+            'force_rmse': np.sqrt(totals['force_se'] / (3 * n_a)),
+            'stress_rmse': np.sqrt(totals['stress_se'] / n_g),
             'energy_loss': totals['energy_loss'] / n_g,
             'force_loss': totals['force_loss'] / (3 * n_a),
             'stress_loss': totals['stress_loss'] / n_g,
@@ -1400,9 +1411,15 @@ def _train_loop_singlehead(
                         jnp.array(val_loss)))
 
                 print(f"  Valid ({val_time:.1f}s) | Loss: {val_loss:.6f} | "
+                      f"E: {val_metrics['energy_loss']:.6f} | "
+                      f"F: {val_metrics['force_loss']:.6f} | "
+                      f"S: {val_metrics['stress_loss']:.6f} | "
                       f"E_MAE: {val_metrics['energy_mae']:.6f} | "
                       f"F_MAE: {val_metrics['force_mae']:.6f} | "
-                      f"S_MAE: {val_metrics['stress_mae']:.6f}", file=fout)
+                      f"S_MAE: {val_metrics['stress_mae']:.6f} | "
+                      f"E_RMSE: {val_metrics['energy_rmse']:.6f} | "
+                      f"F_RMSE: {val_metrics['force_rmse']:.6f} | "
+                      f"S_RMSE: {val_metrics['stress_rmse']:.6f}", file=fout)
 
                 # Update LR schedule
                 unrep_params = unreplicate_pytree(params)
@@ -1705,9 +1722,15 @@ def _train_loop_multihead(
                       f"Total Loss: {mid_val_loss:.6f}", file=fout)
                 for hname, hmetrics in mid_per_head_metrics.items():
                     print(f"    [{hname}] Loss: {hmetrics['total_loss']:.6f} | "
+                          f"E: {hmetrics['energy_loss']:.6f} | "
+                          f"F: {hmetrics['force_loss']:.6f} | "
+                          f"S: {hmetrics['stress_loss']:.6f} | "
                           f"E_MAE: {hmetrics['energy_mae']:.6f} | "
                           f"F_MAE: {hmetrics['force_mae']:.6f} | "
-                          f"S_MAE: {hmetrics['stress_mae']:.6f}", file=fout)
+                          f"S_MAE: {hmetrics['stress_mae']:.6f} | "
+                          f"E_RMSE: {hmetrics['energy_rmse']:.6f} | "
+                          f"F_RMSE: {hmetrics['force_rmse']:.6f} | "
+                          f"S_RMSE: {hmetrics['stress_rmse']:.6f}", file=fout)
 
                 # Update LR schedule
                 _, new_schedule = schedule.update(
@@ -1797,9 +1820,15 @@ def _train_loop_multihead(
               file=fout)
         for hname, hmetrics in per_head_metrics.items():
             print(f"    [{hname}] Loss: {hmetrics['total_loss']:.6f} | "
+                  f"E: {hmetrics['energy_loss']:.6f} | "
+                  f"F: {hmetrics['force_loss']:.6f} | "
+                  f"S: {hmetrics['stress_loss']:.6f} | "
                   f"E_MAE: {hmetrics['energy_mae']:.6f} | "
                   f"F_MAE: {hmetrics['force_mae']:.6f} | "
-                  f"S_MAE: {hmetrics['stress_mae']:.6f}", file=fout)
+                  f"S_MAE: {hmetrics['stress_mae']:.6f} | "
+                  f"E_RMSE: {hmetrics['energy_rmse']:.6f} | "
+                  f"F_RMSE: {hmetrics['force_rmse']:.6f} | "
+                  f"S_RMSE: {hmetrics['stress_rmse']:.6f}", file=fout)
 
         # Update LR schedule
         unrep_params = unreplicate_pytree(params)

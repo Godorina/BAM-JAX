@@ -67,7 +67,10 @@ class RACEXReadout(nnx.Module):
         x_feats: e3nn.IrrepsArray,
     ) -> e3nn.IrrepsArray:
 
-        x_feats_norm = separated_layer_norm (x_feats)/jnp.sqrt(self.avg_n_neighbors)
+        if x_feats.irreps.dim > 1:
+            x_feats_norm = separated_layer_norm(x_feats) / jnp.sqrt(self.avg_n_neighbors)
+        else:
+            x_feats_norm = x_feats / jnp.sqrt(self.avg_n_neighbors)
         x_features = self.x_readout1(species, x_feats_norm)
         x_features = self.x_readout2(x_features)
         x_features = e3nn.gate(
@@ -310,8 +313,9 @@ class RACE(nnx.Module):
             )
             layers.append(layer)
 
+            readout_hidden_irreps = hidden_irreps.filter(keep="0e")
             x_readout = RACEXReadout(
-                hidden_irreps=e3nn.Irreps("64x0e"), # 256
+                hidden_irreps=readout_hidden_irreps,
                 output_irreps=e3nn.Irreps("0e"),
                 x_irreps=x_irreps,
                 n_species=n_species,
@@ -321,7 +325,7 @@ class RACE(nnx.Module):
             x_readouts.append(x_readout)
 
             f_readout = RACEXReadout(
-                hidden_irreps=e3nn.Irreps("64x0e"), # 256
+                hidden_irreps=readout_hidden_irreps,
                 output_irreps=e3nn.Irreps("0e"),
                 x_irreps=input_irreps if i == 0 else hidden_irreps,
                 n_species=n_species,

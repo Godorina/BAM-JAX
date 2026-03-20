@@ -169,21 +169,33 @@ Set `"evaluate_tag": true` in the `"predict"` section of `input.json` to enable 
 
 ## Benchmark Results
 
-### 3BPA (3-(benzyloxy)pyridin-2-amine) — Multihead Fine-tuning
+### 3BPA — Multihead Fine-tuning
 
-RACE model pre-trained on SPICE 1.1.4 dataset, then fine-tuned using multihead replay strategy on 3BPA. Compared against MACE-based fine-tuning methods (ELoRA, MMEA) which use MACE-MP-0 as foundation.
+RACE model pre-trained on SPICE 1.1.4 dataset, then fine-tuned using multihead replay strategy on 3BPA. Compared against MACE-based fine-tuning methods (ELoRA, MMEA) which use MACE-OFF as foundation.
 
-| Temperature | Method | Foundation | E_RMSE (meV) | F_RMSE (meV/Å) |
-|:-:|--------|:-:|:-:|:-:|
-| 300K | ELoRA | MACE-MP-0 | 3.0 | 7.5 |
-| 300K | MMEA | MACE-MP-0 | 2.7 | 7.5 |
-| 300K | **BAM Multihead** | **RACE/SPICE** | **0.083** | **4.94** |
-| 600K | ELoRA | MACE-MP-0 | 6.5 | 15.5 |
-| 600K | MMEA | MACE-MP-0 | 6.5 | 15.4 |
-| 600K | **BAM Multihead** | **RACE/SPICE** | **0.179** | **9.74** |
-| 1200K | ELoRA | MACE-MP-0 | 17.6 | 42.0 |
-| 1200K | MMEA | MACE-MP-0 | 17.1 | 39.7 |
-| 1200K | **BAM Multihead** | **RACE/SPICE** | **0.420** | **23.1** |
+#### 300K
+
+| Method | Foundation | E_RMSE (meV) | F_RMSE (meV/Å) |
+|--------|:-:|:-:|:-:|
+| ELoRA | MACE-OFF | 3.0 | 7.5 |
+| MMEA | MACE-OFF | 2.7 | 7.5 |
+| **BAM Multihead** | **RACE/SPICE** | **0.083** | **4.94** |
+
+#### 600K
+
+| Method | Foundation | E_RMSE (meV) | F_RMSE (meV/Å) |
+|--------|:-:|:-:|:-:|
+| ELoRA | MACE-OFF | 6.5 | 15.5 |
+| MMEA | MACE-OFF | 6.5 | 15.4 |
+| **BAM Multihead** | **RACE/SPICE** | **0.179** | **9.74** |
+
+#### 1200K
+
+| Method | Foundation | E_RMSE (meV) | F_RMSE (meV/Å) |
+|--------|:-:|:-:|:-:|
+| ELoRA | MACE-OFF | 17.6 | 42.0 |
+| MMEA | MACE-OFF | 17.1 | 39.7 |
+| **BAM Multihead** | **RACE/SPICE** | **0.420** | **23.1** |
 
 References:
 - ELoRA: [Low-Rank Adaptation for Equivariant GNNs (ICML 2025)](https://openreview.net/forum?id=hcoxm3Vwgy)

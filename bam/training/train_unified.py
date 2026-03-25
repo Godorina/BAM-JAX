@@ -603,57 +603,6 @@ def make_per_head_grad_step(mesh, loss_fn, num_heads):
     return jax.jit(sharded_fn)
 
 
-def make_accumulate_and_update_step(optimizer, mesh, num_head_configs, ema_decay=0.99):
-    """Accumulate per-head gradients and apply optimizer, all inside shard_map.
-
-    Takes pre-computed per-head grads (already pmean'd) and their grad_weights,
-    accumulates them with weighting, normalizes, and applies the optimizer update.
-    All operations stay inside shard_map to avoid multi-host sharding issues.
-
-    Args: fixed = (graphdef_unused, params, opt_state, schedule_state, ema_params, step)
-          per_head = (grads_0, grad_weight_0, grads_1, grad_weight_1, ...)
-    Returns: (new_params, new_opt_state, new_ema_params, new_step, combined_grad_norm)
-    """
-    N = num_head_configs
-
-    def per_device_fn(params, opt_state, schedule_state, ema_params, step,
-                      *grad_and_weight_args):
-        acc = None
-        total_w = jnp.float32(0.0)
-        for i in range(N):
-            grads_i = grad_and_weight_args[i * 2]
-            w_i = grad_and_weight_args[i * 2 + 1]
-            weighted = jax.tree.map(lambda g: g * w_i, grads_i)
-            if acc is None:
-                acc = weighted
-            else:
-                acc = jax.tree.map(lambda a, g: a + g, acc, weighted)
-            total_w = total_w + w_i
-
-        acc = jax.tree.map(lambda g: g / total_w, acc)
-        combined_norm = optax.global_norm(acc)
-
-        updates, new_opt = optimizer.update(acc, opt_state, params)
-        updates = optax.tree_utils.tree_scale(schedule_state.scale, updates)
-        new_p = optax.apply_updates(params, updates)
-        new_ema = jax.tree.map(
-            lambda ema, p: ema_decay * ema + (1 - ema_decay) * p,
-            ema_params, new_p,
-        )
-        return new_p, new_opt, new_ema, step + 1, combined_norm
-
-    fixed_specs = (P(), P(), P(), P(), P())
-    # Each head contributes (grads=P(), grad_weight=P())
-    per_head_specs = tuple(P() for _ in range(N * 2))
-
-    sharded_fn = shard_map(
-        per_device_fn, mesh=mesh,
-        in_specs=fixed_specs + per_head_specs,
-        out_specs=(P(), P(), P(), P(), P()),
-    )
-    return jax.jit(sharded_fn)
-
-
 def make_simple_optimizer_step(optimizer, mesh, ema_decay=0.99):
     """Apply optimizer update with pre-accumulated gradients.
 

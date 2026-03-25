@@ -21,9 +21,6 @@
 | optax | >= 0.2.5 |
 | ASE | >= 3.27.0 |
 | matscipy | >= 1.2.0 |
-| numpy | - |
-| scipy | - |
-| tqdm | - |
 
 ## Step 1: Create Conda Environment
 

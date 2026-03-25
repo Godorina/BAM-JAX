@@ -78,11 +78,10 @@ class RACECalculator(Calculator):
         config = self.config
 
         if self.atom_energies is None:
-            try:
-                from bam.data.atom_energies import ATOM_ENERGIES
-                self.atom_energies = ATOM_ENERGIES
-            except ImportError:
-                self.atom_energies = np.zeros(120)
+            raise ValueError(
+                "atom_energies must be provided. "
+                "Load from checkpoint or specify in config."
+            )
 
         model = RACE(
             n_species=len(self.atom_energies),
@@ -101,6 +100,7 @@ class RACECalculator(Calculator):
             atom_energies=self.atom_energies,
             l_train=False,
             periodic=True,
+            readout_hidden_size=config.get('readout_hidden_size', None),
             rngs=nnx.Rngs(0),
         )
         self.graphdef, _ = nnx.split(model, nnx.Param)

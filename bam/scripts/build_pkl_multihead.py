@@ -71,7 +71,6 @@ import numpy as np
 from scipy.optimize import minimize
 from tqdm import tqdm
 
-from bam.data.atom_energies import ATOM_ENERGIES, ATOMIC_NUMBER_TO_INDEX
 from bam.data.data_nnx import atoms_to_graph_with_targets
 
 
@@ -162,10 +161,11 @@ def build_pkl(
         atom_energies: Per-species reference energies array.
         atom_indices: Dict mapping atomic number -> species index.
     """
-    if atom_energies is None:
-        atom_energies = ATOM_ENERGIES
-    if atom_indices is None:
-        atom_indices = ATOMIC_NUMBER_TO_INDEX
+    if atom_energies is None or atom_indices is None:
+        raise ValueError(
+            "atom_energies and atom_indices must be provided. "
+            "Use --fit-energies, --atom-energies, or --atom-energies-from-ckpt."
+        )
 
     # Normalize to list
     if isinstance(input_paths, str):
@@ -302,8 +302,12 @@ if __name__ == "__main__":
             print("ERROR: Checkpoint does not contain atom_energies. "
                   "Re-train with updated code to save atom_energies in checkpoint.")
             sys.exit(1)
+        if 'atomic_number_to_index' not in ckpt:
+            print("ERROR: Checkpoint does not contain atomic_number_to_index. "
+                  "Re-train with updated code to save atomic_number_to_index in checkpoint.")
+            sys.exit(1)
         atom_energies = np.array(ckpt['atom_energies'])
-        atom_indices = ckpt.get('atomic_number_to_index', ATOMIC_NUMBER_TO_INDEX)
+        atom_indices = ckpt['atomic_number_to_index']
         if isinstance(atom_indices, list):
             atom_indices = {int(k): v for k, v in enumerate(atom_indices)}
         print(f"  Loaded {len(atom_energies)} species energies from checkpoint")
@@ -430,7 +434,11 @@ if __name__ == "__main__":
         print(f"  Use --atom-energies {save_path} for validation/test sets")
 
     else:
-        print("Using built-in ATOM_ENERGIES (OMat24)")
+        print("ERROR: No atom energies specified. Use one of:")
+        print("  --fit-energies              Fit from input data")
+        print("  --atom-energies FILE        Load from JSON file")
+        print("  --atom-energies-from-ckpt   Load from checkpoint")
+        sys.exit(1)
 
     build_pkl(
         input_paths=args.input,

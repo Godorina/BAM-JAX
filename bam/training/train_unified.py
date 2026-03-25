@@ -654,6 +654,41 @@ def make_accumulate_and_update_step(optimizer, mesh, num_head_configs, ema_decay
     return jax.jit(sharded_fn)
 
 
+def make_simple_optimizer_step(optimizer, mesh, ema_decay=0.99):
+    """Apply optimizer update with pre-accumulated gradients.
+
+    This is used with online accumulation where gradients are accumulated
+    in the training loop itself, reducing peak memory usage.
+
+    Args:
+        optimizer: Optax optimizer
+        mesh: JAX mesh for sharding
+        ema_decay: EMA decay rate
+
+    Returns:
+        JIT-compiled function that takes (params, opt_state, schedule_state,
+        ema_params, step, accumulated_grads) and returns updated state.
+    """
+    def per_device_fn(params, opt_state, schedule_state, ema_params, step, acc_grads):
+        combined_norm = optax.global_norm(acc_grads)
+
+        updates, new_opt = optimizer.update(acc_grads, opt_state, params)
+        updates = optax.tree_utils.tree_scale(schedule_state.scale, updates)
+        new_p = optax.apply_updates(params, updates)
+        new_ema = jax.tree.map(
+            lambda ema, p: ema_decay * ema + (1 - ema_decay) * p,
+            ema_params, new_p,
+        )
+        return new_p, new_opt, new_ema, step + 1, combined_norm
+
+    sharded_fn = shard_map(
+        per_device_fn, mesh=mesh,
+        in_specs=(P(), P(), P(), P(), P(), P()),
+        out_specs=(P(), P(), P(), P(), P()),
+    )
+    return jax.jit(sharded_fn)
+
+
 # =============================================================================
 # Evaluation
 # =============================================================================
@@ -1486,9 +1521,13 @@ def _train_loop_multihead(
     max_edges_per_batch = config.get('max_edges_per_batch', None)
 
     grad_step = make_per_head_grad_step(mesh, loss_fn, num_heads)
-    accumulate_and_update = make_accumulate_and_update_step(
-        optimizer, mesh, num_head_configs=len(head_configs),
-        ema_decay=config.get('ema_decay', 0.99),
+    # Use simple optimizer step with online accumulation for memory efficiency
+    simple_optimizer_step = make_simple_optimizer_step(
+        optimizer, mesh, ema_decay=config.get('ema_decay', 0.99),
+    )
+    # Pre-compute total grad weight for normalization
+    total_grad_weight = sum(
+        hc.get('grad_weight', 1.0) for hc in head_configs
     )
 
     # Pre-build eval resources (local mesh + JIT-compiled eval_step)
@@ -1532,8 +1571,9 @@ def _train_loop_multihead(
 
         is_first_step = True
         while True:
-            # Per-head sequential: load batch → grad → free, one head at a time
-            per_head_grads = []
+            # Online accumulation: compute grad → accumulate → free, one head at a time
+            # This keeps only 1 gradient in memory instead of num_heads gradients
+            acc_grads = None
             per_head_metrics_list = []
             head_log_meta = []
             step_start_time = time.time()
@@ -1572,8 +1612,15 @@ def _train_loop_multihead(
 
                 del batch
 
-                per_head_grads.append(grads)
-                del grads
+                # Online accumulation: accumulate weighted gradients immediately
+                grad_weight = head_cfg.get('grad_weight', 1.0)
+                if acc_grads is None:
+                    acc_grads = jax.tree.map(lambda g: g * grad_weight, grads)
+                else:
+                    acc_grads = jax.tree.map(
+                        lambda acc, g: acc + g * grad_weight, acc_grads, grads
+                    )
+                del grads  # Free gradient immediately after accumulation
 
                 per_head_metrics_list.append({
                     'loss': loss_i,
@@ -1585,26 +1632,22 @@ def _train_loop_multihead(
                     'n_atoms': aux_i['n_atoms'],
                 })
 
-            # Accumulate grads + optimizer update inside shard_map (no host-side ops)
-            grad_and_weight_args = []
-            for i, head_cfg in enumerate(head_configs):
-                grad_and_weight_args.append(per_head_grads[i])
-                grad_and_weight_args.append(head_weights[head_cfg["head_idx"]]['grad_weight'])
-            del per_head_grads
+            # Normalize accumulated gradients by total weight
+            acc_grads = jax.tree.map(lambda g: g / total_grad_weight, acc_grads)
 
             if is_first_step and jax.process_index() == 0:
-                print(f"  [JIT] accumulate_and_update compiling...", flush=True)
+                print(f"  [JIT] simple_optimizer_step compiling...", flush=True)
                 t0 = time.time()
 
             params, opt_state, ema_params, step, combined_grad_norm = \
-                accumulate_and_update(
+                simple_optimizer_step(
                     params, opt_state, schedule_state, ema_params, step,
-                    *grad_and_weight_args,
+                    acc_grads,
                 )
-            del grad_and_weight_args
+            del acc_grads
 
             if is_first_step and jax.process_index() == 0:
-                print(f"  [JIT] accumulate_and_update done in {time.time() - t0:.1f}s",
+                print(f"  [JIT] simple_optimizer_step done in {time.time() - t0:.1f}s",
                       flush=True)
                 print(f"  [JIT] First step total: {time.time() - step_start_time:.1f}s",
                       flush=True)
@@ -1937,10 +1980,23 @@ def train_unified(config: Dict):
             print(f"  Head {hc['head_idx']}: {hc['name']}", file=fout)
     print("=" * 70, file=fout)
 
+    # Skip foundation_ckpt if restarting from existing checkpoint
+    skip_foundation = False
+    if config.get('restart', False):
+        resume_from = Path(config.get('resume_from', ckpt_dir))
+        for ckpt_name in ['ckpt_latest.pkl', 'ckpt_best.pkl', 'ckpt_multihead_best.pkl']:
+            if (resume_from / ckpt_name).exists():
+                skip_foundation = True
+                print(f"Restart mode: skipping foundation_ckpt (will load from {resume_from})", file=fout)
+                break
+
     # Create model
-    graphdef, params, load_info = create_model(config, is_multihead)
+    config_for_model = config.copy()
+    if skip_foundation:
+        config_for_model['foundation_ckpt'] = None
+    graphdef, params, load_info = create_model(config_for_model, is_multihead)
     ema_params = params
-    n_params = sum(x.size for x in jax.tree.leaves(params))
+    n_params = sum(x.size for x in jax.tree.leaves(params)) # 총 파라미터 개수 계산
     print(f"Model parameters: {n_params:,}", file=fout)
 
     # Foundation model provenance
@@ -1978,6 +2034,7 @@ def train_unified(config: Dict):
     schedule_state = schedule.init(params)
 
     # Broadcast initial state (multi-host)
+    # broadcast_one_to_all : 동일한 가중치를 각 노드에 복사
     if jax.process_count() > 1:
         params = multihost_utils.broadcast_one_to_all(params)
         ema_params = multihost_utils.broadcast_one_to_all(ema_params)
@@ -1985,6 +2042,7 @@ def train_unified(config: Dict):
         schedule_state = multihost_utils.broadcast_one_to_all(schedule_state)
 
     # Replicate across devices
+    # Replicate : 동일한 가중치를 각 지피유에 복사
     params = replicate_pytree(params, mesh)
     ema_params = replicate_pytree(ema_params, mesh)
     opt_state = replicate_pytree(opt_state, mesh)
@@ -1992,9 +2050,12 @@ def train_unified(config: Dict):
     step = replicate(jnp.array(0), mesh)
 
     # Loss function
-    loss_type = config.get('loss_type', 'huber')
-    huber_delta = config.get('huber_delta', 0.02)
-    loss_fn = partial(LOSS_FUNCTIONS[loss_type], delta=huber_delta)
+    loss_type = config.get('loss_type', 'mse')
+    if loss_type == 'huber':
+        huber_delta = config.get('huber_delta', 0.02)
+        loss_fn = partial(LOSS_FUNCTIONS[loss_type], delta=huber_delta)
+    else:
+        loss_fn = LOSS_FUNCTIONS[loss_type]
 
     # Load checkpoint if restarting
     best_val_loss = float('inf')
@@ -2004,6 +2065,8 @@ def train_unified(config: Dict):
     if config.get('restart', False):
         ckpt_loaded = False
         ckpt_data = None
+        # resume_from: checkpoint directory to load from (defaults to ckpt_dir)
+        resume_from = Path(config.get('resume_from', ckpt_dir))
 
         if jax.process_index() == 0:
             if config.get('reset_best_loss', False):
@@ -2013,7 +2076,7 @@ def train_unified(config: Dict):
                 ckpt_order = ['ckpt_latest.pkl', 'ckpt_best.pkl',
                               'ckpt_multihead_best.pkl']
             for ckpt_name in ckpt_order:
-                ckpt_path = ckpt_dir / ckpt_name
+                ckpt_path = resume_from / ckpt_name
                 if ckpt_path.exists():
                     ckpt_data = load_checkpoint(str(ckpt_path))
                     ckpt_loaded = True
@@ -2176,22 +2239,25 @@ if __name__ == "__main__":
             print(f"Loading atom energies from {atom_energies_path}")
         with open(atom_energies_path) as f:
             ae_data = json.load(f)
-        if isinstance(ae_data, dict):
-            config['atom_energies'] = ae_data['atom_energies']
-            if 'atomic_number_to_index' in ae_data:
-                config['atomic_number_to_index'] = {
-                    int(k): v for k, v in ae_data['atomic_number_to_index'].items()
-                }
-            else:
-                config['atomic_number_to_index'] = dict(ATOMIC_NUMBER_TO_INDEX)
-        else:
-            config['atom_energies'] = ae_data
-            config['atomic_number_to_index'] = dict(ATOMIC_NUMBER_TO_INDEX)
+        if not isinstance(ae_data, dict):
+            raise ValueError(
+                f"atom_energies file {atom_energies_path} is old format (list). "
+                "Regenerate with updated build_pkl_multihead.py using --fit-energies"
+            )
+        if 'atomic_number_to_index' not in ae_data:
+            raise ValueError(
+                f"atom_energies file {atom_energies_path} missing 'atomic_number_to_index'. "
+                "Regenerate with updated build_pkl_multihead.py using --fit-energies"
+            )
+        config['atom_energies'] = ae_data['atom_energies']
+        config['atomic_number_to_index'] = {
+            int(k): v for k, v in ae_data['atomic_number_to_index'].items()
+        }
     else:
-        if jax.process_index() == 0:
-            print("Using built-in ATOM_ENERGIES")
-        config['atom_energies'] = ATOM_ENERGIES.tolist()
-        config['atomic_number_to_index'] = dict(ATOMIC_NUMBER_TO_INDEX)
+        raise ValueError(
+            "atom_energies_path not specified or file does not exist. "
+            "Set 'atom_energies_path' in config JSON to the path of atom_energies.json"
+        )
 
     mode_str = "Multihead" if config.get('multihead', False) else "Single-head"
     if jax.process_index() == 0:

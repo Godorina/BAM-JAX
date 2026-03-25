@@ -37,5 +37,17 @@ eval_results.json
 .DS_Store
 Thumbs.db
 
+# Test/experimental (local only)
+bam/models/race_ct_nnx.py
+bam/models/race_ct_multihead_nnx.py
+bam/training/galore.py
+bam/training/gradient_analysis.py
+bam/training/pcgrad.py
+bam/examples/bam-ct/
+bam/examples/galore/
+bam/examples/pcgrad_irrep-aware/
+bam/examples/multihead/bam_sds_260315/
+bam/examples/multihead/train_unified_260315_sds.py
+
 # Claude Code
 .claude/

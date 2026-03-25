@@ -10,12 +10,13 @@ Unified script: replaces build_pkl.py and build_pkl_multi_input.py.
 Usage
 ================================================================================
 
-1) OMat24 replay (built-in ATOM_ENERGIES, no fitting needed):
+1) OMat24 replay (load atom energies from checkpoint):
 
     python -m bam.scripts.build_pkl_multihead \
         --input data/omat24_train.traj \
         --output data/omat24_train_pkl \
         --prefix replay_train \
+        --atom-energies-from-ckpt ckpt_best.pkl \
         --chunk-size 100000
 
 2) Single dataset training (fit E0 from data, saves atom_energies.json):
@@ -289,9 +290,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Determine atom energies and index mapping
-    # Priority: --atom-energies-from-ckpt > --atom-energies > --fit-energies > built-in
-    atom_energies = ATOM_ENERGIES
-    atom_indices = ATOMIC_NUMBER_TO_INDEX
+    # Priority: --atom-energies-from-ckpt > --atom-energies > --fit-energies
+    atom_energies = None
+    atom_indices = None
 
     if args.atom_energies_from_ckpt:
         # Load atom energies from a training checkpoint (e.g., foundation model)

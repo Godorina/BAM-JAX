@@ -2204,7 +2204,6 @@ def train_unified(config: Dict):
 
 if __name__ == "__main__":
     import json
-    from bam.data.atom_energies import ATOM_ENERGIES, ATOMIC_NUMBER_TO_INDEX
 
     # Initialize distributed runtime FIRST
     try:

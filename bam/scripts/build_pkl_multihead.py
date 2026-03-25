@@ -162,12 +162,6 @@ def build_pkl(
         atom_energies: Per-species reference energies array.
         atom_indices: Dict mapping atomic number -> species index.
     """
-    if atom_energies is None or atom_indices is None:
-        raise ValueError(
-            "atom_energies and atom_indices must be provided. "
-            "Use --fit-energies, --atom-energies, or --atom-energies-from-ckpt."
-        )
-
     # Normalize to list
     if isinstance(input_paths, str):
         input_paths = [input_paths]
